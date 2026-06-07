@@ -1,63 +1,33 @@
-# OSC Comparison: Rust vs Python
+# OSC Comparison: Rust vs Python — DONE
 
-## Goal
-Capture and diff the OSC messages produced by the Python (`jdw-pycompose`) and Rust (`jdw-suite`) implementations for the same `.bbd` file to find discrepancies causing audio issues.
+## Status: All 3 phases verified (setup, update, play) for arena.bbd
 
-## Approach
+Play phase: 94/94 messages match by external ID.
 
-### 1. Capture Python OSC Output
-
-Patch Python `jdw-pycompose` to dump OSC packets instead of (or in addition to) sending them.
-
-**Option C: tcpdump (no code change)**
-```bash
-sudo tcpdump -i lo -U -w /tmp/python_dump.pcap udp port 13339
-```
-
-### 2. Capture Rust OSC Output
-
-The `dump_queue_update()` function in `jdw-billboarding-backend` already generates text output of all packets `jdw play` would send.
-
-**Usage:**
-```rust
-use jdw_billboarding_backend::{parse_billboard_file, dump_queue_update};
-
-let bb = parse_billboard_file("arena.bbd").unwrap();
-let lines = dump_queue_update(&bb);
-for l in lines { println!("{}", l); }
-```
-
-Or use the example binary:
-```bash
-cargo run --example dump_osc path/to/arena.bbd > rust_dump.txt
-```
-
-### 3. Diff the Outputs
+## Automated Tool
 
 ```bash
-diff python_dump.txt rust_dump.txt | less
+cd jdw-billboarding-backend
+./capture_compare.sh [song.bbd]
 ```
 
-Focus on:
-- Missing or extra args per message
-- Different arg values (especially `amp`, `freq`, `sus`, `time`)
-- Missing tracks (group filter issue — now fixed)
-- Wrong instrument name routing
-- Wrong OSC address
+Single command, non-interactive:
+1. `sudo -v` → validates sudo once
+2. Starts tcpdump on port 13339 (Python osc-router)
+3. Runs `python3 run.py --setup`, `--update`, then play in sequence
+4. OSC sentinel markers split the pcap into per-phase files
+5. Dumps Rust equivalents for all 3 phases
+6. Prints comparison table + message type breakdowns
 
-## Current Known Issues (things to check)
+## Historical Issues (all resolved)
 
-1. ~~Group filter not applied~~ — **FIXED**: `send_full_queue_update` now respects `>>>` filters
-2. ~~Default args not passed to elements~~ — **FIXED**: `track_to_timed_packets` merges default + header + track overrides + element inline args, matching Python precedence
-3. `sus` gate time — check if Python vs Rust compute differently
-4. `time` arg — check if internal scheduling args leak into OSC
-5. Instrument names — verify SP_/DR_ prefix stripping matches Python
-6. SynthDef loading — verify all synthdefs from config paths are loaded
-
-## Setup/Update/Play Differences
-
-| Command | Python | Rust | Equivalent? |
-|---------|--------|------|-------------|
-| `setup` | setup() + configure() + beep | `send_full_setup` + `send_full_commands` | Yes |
-| `update` | configure() + beep | `send_full_commands` | Yes |
-| `play` | update_queue() | `send_full_queue_update` | Yes (after fix) |
+1. ~~Group filter not applied~~ — FIXED: `send_full_queue_update` respects `>>>` filters
+2. ~~Default args not passed to elements~~ — FIXED: args precedence matches Python
+3. ~~Rest/silence `x` sent as /play_sample~~ — FIXED: `is_symbol` checks prefix
+4. ~~HashMap iteration non-deterministic~~ — FIXED: sorted keys
+5. ~~Effect args missing section header overrides (out, relT, etc.)~~ — FIXED: merged in build_billboard
+6. ~~Commands (routers) sent after effects~~ — FIXED: correct SC bus order
+7. ~~Router in/out args as Int~~ — FIXED: Float for jdw-sc /note_on handler
+8. ~~Samples not loaded~~ — FIXED: sample_loader.rs
+9. ~~Drones not created~~ — FIXED: send_drones_create
+10. ~~/create_router, /create_effect not translated~~ — FIXED: command translation
