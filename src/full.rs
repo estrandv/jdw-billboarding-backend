@@ -2,8 +2,8 @@
 ///
 /// Stages (per PLAN_full_billboard_parser.md):
 ///   Stage 1 — Line classifier + continuation + inline comments
-///   Stage 2 — Section grouper                                    ← current
-///   Stage 3 — Low-level parsers
+///   Stage 2 — Section grouper
+///   Stage 3 — Low-level parsers                                  ← current
 ///   Stage 4 — Billboard construction + argument inheritance
 ///   Stage 5 — OSC conversion
 ///   Stage 6 — jdw-suite integration
@@ -316,6 +316,410 @@ pub fn group_sections(classified: &[ClassifiedLine]) -> GroupedBillboard {
         sections,
         orphan_lines,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3 — Low-Level Parsers
+// ---------------------------------------------------------------------------
+
+/// Parsed synth header data from `[@|*@][SP_|DR_]instrument[:group] [args] [pad_config]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SynthHeaderData {
+    pub instrument: String,
+    pub is_drone: bool,
+    pub is_sampler: bool,
+    pub is_selected: bool,
+    pub group: Option<String>,
+    pub args: Vec<(String, String)>,
+    /// Sampler pad config: `[(index, sample_id), ...]`
+    pub pad_config: Vec<(u32, u32)>,
+}
+
+/// Parsed track metadata from `<group[;arg1,arg2]>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrackMeta {
+    pub group_override: Option<String>,
+    /// `(key, operator, value)` — operator is one of `=`, `+`, `-`, `*`.
+    pub arg_overrides: Vec<(String, String, String)>,
+}
+
+/// Parsed effect definition from `€type:id [args]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectData {
+    pub effect_type: String,
+    pub id: String,
+    pub args: Vec<(String, String)>,
+}
+
+/// Command context.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CommandContext {
+    All,
+    Update,
+    Queue,
+}
+
+/// Parsed command from `[COMMAND_TYPE] /address [args...]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandData {
+    pub context: CommandContext,
+    pub address: String,
+    pub args: Vec<String>,
+}
+
+/// Parsed group filter from `>>> name1 name2 ...`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterData {
+    pub groups: Vec<String>,
+}
+
+// -- Arg list parser (shared) --
+
+/// Parse a comma-separated arg string like `amp0.5,sus1.0,time0.5`.
+///
+/// Each token is `key`, `key=value`, `key+value`, or an implicit
+/// `<name><number>` pair like `amp0.5`.
+/// Returns `Vec<(key, operator, value)>` where operator is one of
+/// `=`, `+`, `-`, `*`, or `_` (implicit/no operator).
+pub fn parse_arg_list(s: &str) -> Vec<(String, String, String)> {
+    if s.trim().is_empty() {
+        return Vec::new();
+    }
+    s.split(',')
+        .map(|token| {
+            let token = token.trim();
+            if token.is_empty() {
+                return ("_".to_string(), String::new(), String::new());
+            }
+            // Find explicit operator position
+            for (i, b) in token.as_bytes().iter().enumerate() {
+                if *b == b'=' || *b == b'+' || *b == b'-' || *b == b'*' {
+                    let key = token[..i].trim().to_string();
+                    let op = token[i..=i].to_string();
+                    let val = token[i + 1..].trim().to_string();
+                    return (key, op, val);
+                }
+            }
+            // No explicit operator — try splitting as implicit <name><number>.
+            // Name is [A-Za-z_]+; number starts at first digit.
+            if let Some(digit_start) = token.find(|c: char| c.is_ascii_digit()) {
+                let before = &token[..digit_start];
+                let after = &token[digit_start..];
+                if !before.is_empty() && before.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
+                    return (before.to_string(), "_".to_string(), after.to_string());
+                }
+            }
+            // Bare value (no name)
+            (token.to_string(), "_".to_string(), String::new())
+        })
+        .collect()
+}
+
+/// Parse a simple `key=val` arg list (no operators), returning `HashMap`-like pairs.
+pub fn parse_simple_args(s: &str) -> Vec<(String, String)> {
+    parse_arg_list(s)
+        .into_iter()
+        .map(|(k, _op, v)| (k, v))
+        .collect()
+}
+
+// -- Synth header parser --
+
+/// Parse a synth header line (without leading `@`/`*@`).
+///
+/// Expected format: `[SP_|DR_]instrument[:group] [args] [pad_config]`
+fn parse_synth_header_inner(content: &str, is_selected: bool) -> Result<SynthHeaderData, String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Err("Empty synth header".to_string());
+    }
+
+    let rest = trimmed;
+
+    // Check for SP_ / DR_ prefix
+    let is_sampler = rest.starts_with("SP_");
+    let is_drone = rest.starts_with("DR_");
+    let after_prefix = if is_sampler || is_drone {
+        &rest[3..]
+    } else {
+        rest
+    };
+
+    // Extract instrument name (up to ':', space, or end)
+    let mut instrument = String::new();
+    let mut group = None;
+    let mut cursor = 0;
+    let bytes = after_prefix.as_bytes();
+
+    while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() && bytes[cursor] != b':' {
+        instrument.push(bytes[cursor] as char);
+        cursor += 1;
+    }
+
+    if instrument.is_empty() {
+        return Err("Empty instrument name in synth header".to_string());
+    }
+
+    // Check for :group
+    if cursor < bytes.len() && bytes[cursor] == b':' {
+        cursor += 1; // skip ':'
+        let mut g = String::new();
+        while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+            g.push(bytes[cursor] as char);
+            cursor += 1;
+        }
+        if !g.is_empty() {
+            group = Some(g);
+        }
+    }
+
+    // Remaining: args and pad_config
+    let remainder = after_prefix[cursor..].trim();
+    let mut args = Vec::new();
+    let mut pad_config = Vec::new();
+
+                if !remainder.is_empty() {
+        // Try to split into arg portion vs pad config portion.
+        // Pad config looks like `1:0 2:14` — space-separated num:num pairs.
+        // Args look like `amp0.5,sus1.0` — comma-separated key=val or
+        // single tokens like `amp0.5`.
+        let tokens: Vec<&str> = remainder.split_whitespace().collect();
+        let mut in_pad_config = false;
+
+        for token in &tokens {
+            if in_pad_config {
+                if let Some((idx_str, sid_str)) = token.split_once(':') {
+                    if let (Ok(idx), Ok(sid)) = (idx_str.parse::<u32>(), sid_str.parse::<u32>()) {
+                        pad_config.push((idx, sid));
+                        continue;
+                    }
+                }
+                args.extend(parse_simple_args(token));
+            } else if let Some((idx_str, sid_str)) = token.split_once(':') {
+                if idx_str.chars().all(|c| c.is_ascii_digit())
+                    && sid_str.chars().all(|c| c.is_ascii_digit())
+                {
+                    if let (Ok(idx), Ok(sid)) = (idx_str.parse::<u32>(), sid_str.parse::<u32>()) {
+                        pad_config.push((idx, sid));
+                        in_pad_config = true;
+                        continue;
+                    }
+                }
+                args.extend(parse_simple_args(token));
+            } else {
+                // Any other token: try parsing as args
+                args.extend(parse_simple_args(token));
+            }
+        }
+    }
+
+    Ok(SynthHeaderData {
+        instrument,
+        is_drone,
+        is_sampler,
+        is_selected,
+        group,
+        args,
+        pad_config,
+    })
+}
+
+/// Parse a synth header line: `[@|*@][SP_|DR_]instrument[:group] [args]`.
+pub fn parse_synth_header(content: &str) -> Result<SynthHeaderData, String> {
+    let trimmed = content.trim();
+    let is_selected = trimmed.starts_with("*@");
+    if !trimmed.starts_with('@') && !trimmed.starts_with("*@") {
+        return Err("Synth header must start with @ or *@".to_string());
+    }
+
+    let inner = if is_selected {
+        &trimmed[2..]
+    } else {
+        &trimmed[1..]
+    };
+
+    parse_synth_header_inner(inner, is_selected)
+}
+
+// -- Track metadata parser --
+
+/// Parse track metadata from `<group[;arg1,arg2]>`.
+///
+/// If the line doesn't start with `<`, returns `None` (no metadata).
+pub fn parse_track_metadata(content: &str) -> Option<TrackMeta> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('<') {
+        return None;
+    }
+
+    // Find the closing '>'
+    let close = trimmed.find('>')?;
+    let inner = &trimmed[1..close];
+
+    let (group_override, arg_str) = match inner.split_once(';') {
+        Some((g, a)) => (Some(g.trim().to_string()), a),
+        None => (Some(inner.trim().to_string()), ""),
+    };
+
+    let group_override = if group_override.as_ref().map_or(true, |s| s.is_empty()) {
+        None
+    } else {
+        group_override
+    };
+
+    let arg_overrides = if arg_str.is_empty() {
+        Vec::new()
+    } else {
+        parse_arg_list(arg_str)
+            .into_iter()
+            .map(|(k, op, v)| (k, op, v))
+            .collect()
+    };
+
+    Some(TrackMeta {
+        group_override,
+        arg_overrides,
+    })
+}
+
+// -- Effect definition parser --
+
+/// Parse an effect definition: `€type:id [args]`.
+pub fn parse_effect(content: &str) -> Result<EffectData, String> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with('€') {
+        return Err("Effect must start with €".to_string());
+    }
+
+    // Skip the € character (multi-byte in UTF-8, use char_indices)
+    let after_euro = &trimmed[trimmed.char_indices().nth(1).map(|(i, _)| i).unwrap_or(trimmed.len())..];
+
+    // Find ':' separating type from id
+    let colon = after_euro
+        .find(':')
+        .ok_or_else(|| "Effect definition missing ':'".to_string())?;
+
+    let effect_type = after_euro[..colon].trim().to_string();
+    let rest = after_euro[colon + 1..].trim();
+
+    // Split id from args on whitespace
+    let (id, args_str) = match rest.find(char::is_whitespace) {
+        Some(pos) => (rest[..pos].trim().to_string(), rest[pos..].trim()),
+        None => (rest.to_string(), ""),
+    };
+
+    let args = parse_simple_args(args_str);
+
+    Ok(EffectData {
+        effect_type,
+        id,
+        args,
+    })
+}
+
+// -- Command parser --
+
+/// Parse a command: `[COMMAND_TYPE] /address [args...]`.
+pub fn parse_command(content: &str) -> Result<CommandData, String> {
+    let trimmed = content.trim();
+
+    let (context, rest) = if trimmed.starts_with("UPDATE_COMMAND") {
+        (CommandContext::Update, trimmed[14..].trim())
+    } else if trimmed.starts_with("QUEUE_COMMAND") {
+        (CommandContext::Queue, trimmed[13..].trim())
+    } else if trimmed.starts_with("COMMAND") {
+        // Ensure it's "COMMAND" not just "COMMAND_SOMETHING"
+        let after = &trimmed[7..];
+        if after.is_empty() || after.starts_with(char::is_whitespace) {
+            (CommandContext::All, after.trim())
+        } else {
+            return Err(format!("Unknown command prefix in: {}", trimmed));
+        }
+    } else {
+        return Err(format!("Command does not start with COMMAND: {}", trimmed));
+    };
+
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err("Command missing address".to_string());
+    }
+
+    let address = tokens[0].to_string();
+    if !address.starts_with('/') {
+        return Err(format!("Command address must start with '/': {}", address));
+    }
+
+    let args: Vec<String> = tokens[1..].iter().map(|s| s.to_string()).collect();
+
+    Ok(CommandData {
+        context,
+        address,
+        args,
+    })
+}
+
+// -- Group filter parser --
+
+/// Parse a group filter: `>>> name1 name2 ...`.
+pub fn parse_filter(content: &str) -> Result<FilterData, String> {
+    let trimmed = content.trim();
+    if !trimmed.starts_with(">>>") {
+        return Err("Filter must start with >>>".to_string());
+    }
+
+    let rest = trimmed[3..].trim();
+    if rest.is_empty() {
+        return Ok(FilterData {
+            groups: Vec::new(),
+        });
+    }
+
+    let groups: Vec<String> = rest.split_whitespace().map(|s| s.to_string()).collect();
+    Ok(FilterData { groups })
+}
+
+// -- Convenience: parse all low-level structures from a GroupedBillboard --
+
+/// Parse all synth headers in a `GroupedBillboard`, returning errors per section.
+pub fn parse_all_headers(g: &GroupedBillboard) -> Vec<Result<SynthHeaderData, String>> {
+    g.sections
+        .iter()
+        .map(|sec| parse_synth_header(&sec.header.content))
+        .collect()
+}
+
+/// Parse all track metadata lines in a section.
+pub fn parse_tracks_metadata(section: &SectionGroup) -> Vec<Option<TrackMeta>> {
+    section
+        .tracks
+        .iter()
+        .map(|t| parse_track_metadata(&t.content))
+        .collect()
+}
+
+/// Parse all effects in a section.
+pub fn parse_section_effects(section: &SectionGroup) -> Vec<Result<EffectData, String>> {
+    section
+        .effects
+        .iter()
+        .map(|e| parse_effect(&e.content))
+        .collect()
+}
+
+/// Parse all commands.
+pub fn parse_all_commands(g: &GroupedBillboard) -> Vec<Result<CommandData, String>> {
+    g.commands
+        .iter()
+        .map(|c| parse_command(&c.content))
+        .collect()
+}
+
+/// Parse all filters.
+pub fn parse_all_filters(g: &GroupedBillboard) -> Vec<Result<FilterData, String>> {
+    g.filters
+        .iter()
+        .map(|f| parse_filter(&f.content))
+        .collect()
 }
 
 #[cfg(test)]
@@ -697,6 +1101,235 @@ e4 f4
         assert_eq!(g.orphan_lines.len(), 1);
         assert_eq!(g.orphan_lines[0].content, "c4 d4");
         assert_eq!(g.sections[0].tracks.len(), 1);
+    }
+
+    // -- parse_arg_list --
+
+    #[test]
+    fn test_parse_arg_list_empty() {
+        assert!(parse_arg_list("").is_empty());
+        assert!(parse_arg_list("  ").is_empty());
+    }
+
+    #[test]
+    fn test_parse_arg_list_simple() {
+        let r = parse_arg_list("amp0.5");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0], ("amp".to_string(), "_".to_string(), "0.5".to_string()));
+    }
+
+    #[test]
+    fn test_parse_arg_list_bare_value() {
+        let r = parse_arg_list("0.5");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0], ("0.5".to_string(), "_".to_string(), "".to_string()));
+    }
+
+    #[test]
+    fn test_parse_arg_list_keyval() {
+        let r = parse_arg_list("amp=0.5,sus=1.0");
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0], ("amp".to_string(), "=".to_string(), "0.5".to_string()));
+        assert_eq!(r[1], ("sus".to_string(), "=".to_string(), "1.0".to_string()));
+    }
+
+    #[test]
+    fn test_parse_arg_list_operators() {
+        let r = parse_arg_list("amp*2,sus+0.5,gain-3");
+        assert_eq!(r[0], ("amp".to_string(), "*".to_string(), "2".to_string()));
+        assert_eq!(r[1], ("sus".to_string(), "+".to_string(), "0.5".to_string()));
+        assert_eq!(r[2], ("gain".to_string(), "-".to_string(), "3".to_string()));
+    }
+
+    // -- parse_synth_header --
+
+    #[test]
+    fn test_parse_synth_header_basic() {
+        let r = parse_synth_header("@moogBass").unwrap();
+        assert_eq!(r.instrument, "moogBass");
+        assert!(!r.is_drone);
+        assert!(!r.is_sampler);
+        assert!(!r.is_selected);
+        assert_eq!(r.group, None);
+        assert!(r.args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_synth_header_with_group() {
+        let r = parse_synth_header("@moogBass:bass").unwrap();
+        assert_eq!(r.instrument, "moogBass");
+        assert_eq!(r.group, Some("bass".to_string()));
+    }
+
+    #[test]
+    fn test_parse_synth_header_with_args() {
+        let r = parse_synth_header("@moogBass:bass amp0.5,sus1.0").unwrap();
+        assert_eq!(r.instrument, "moogBass");
+        assert_eq!(r.group, Some("bass".to_string()));
+        assert!(r.args.contains(&("amp".to_string(), "0.5".to_string())));
+        assert!(r.args.contains(&("sus".to_string(), "1.0".to_string())));
+    }
+
+    #[test]
+    fn test_parse_synth_header_selected() {
+        let r = parse_synth_header("*@SP_Roland808:drums").unwrap();
+        assert!(r.is_selected);
+        assert!(r.is_sampler);
+        assert!(!r.is_drone);
+        assert_eq!(r.instrument, "Roland808");
+        assert_eq!(r.group, Some("drums".to_string()));
+    }
+
+    #[test]
+    fn test_parse_synth_header_drone() {
+        let r = parse_synth_header("@DR_aPad:ambient amp0.0").unwrap();
+        assert!(r.is_drone);
+        assert!(!r.is_sampler);
+        assert_eq!(r.instrument, "aPad");
+        assert_eq!(r.group, Some("ambient".to_string()));
+        assert!(r.args.contains(&("amp".to_string(), "0.0".to_string())));
+    }
+
+    #[test]
+    fn test_parse_synth_header_pad_config() {
+        let r = parse_synth_header("*@SP_Roland808:drums 1:0 2:14 3:26").unwrap();
+        assert!(r.is_sampler);
+        assert!(r.is_selected);
+        assert!(r.pad_config.contains(&(1, 0)));
+        assert!(r.pad_config.contains(&(2, 14)));
+        assert!(r.pad_config.contains(&(3, 26)));
+    }
+
+    // -- parse_track_metadata --
+
+    #[test]
+    fn test_parse_track_metadata_none() {
+        assert!(parse_track_metadata("c4 d4 e4").is_none());
+    }
+
+    #[test]
+    fn test_parse_track_metadata_group_only() {
+        let m = parse_track_metadata("<harmony> g4 a4").unwrap();
+        assert_eq!(m.group_override, Some("harmony".to_string()));
+        assert!(m.arg_overrides.is_empty());
+    }
+
+    #[test]
+    fn test_parse_track_metadata_with_args() {
+        let m = parse_track_metadata("<harmony; amp*1.5, sus+0.3> g4 a4").unwrap();
+        assert_eq!(m.group_override, Some("harmony".to_string()));
+        assert_eq!(m.arg_overrides.len(), 2);
+        assert_eq!(m.arg_overrides[0], ("amp".to_string(), "*".to_string(), "1.5".to_string()));
+    }
+
+    // -- parse_effect --
+
+    #[test]
+    fn test_parse_effect_basic() {
+        let e = parse_effect("€reverb:main").unwrap();
+        assert_eq!(e.effect_type, "reverb");
+        assert_eq!(e.id, "main");
+        assert!(e.args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_effect_with_args() {
+        let e = parse_effect("€reverb:main room0.9,mix0.5").unwrap();
+        assert_eq!(e.effect_type, "reverb");
+        assert_eq!(e.id, "main");
+        assert!(e.args.contains(&("room".to_string(), "0.9".to_string())));
+        assert!(e.args.contains(&("mix".to_string(), "0.5".to_string())));
+    }
+
+    // -- parse_command --
+
+    #[test]
+    fn test_parse_command_basic() {
+        let c = parse_command("COMMAND /set_bpm 120").unwrap();
+        assert_eq!(c.context, CommandContext::All);
+        assert_eq!(c.address, "/set_bpm");
+        assert_eq!(c.args, vec!["120"]);
+    }
+
+    #[test]
+    fn test_parse_command_update() {
+        let c = parse_command("UPDATE_COMMAND /transpose 5").unwrap();
+        assert_eq!(c.context, CommandContext::Update);
+        assert_eq!(c.address, "/transpose");
+        assert_eq!(c.args, vec!["5"]);
+    }
+
+    #[test]
+    fn test_parse_command_queue() {
+        let c = parse_command("QUEUE_COMMAND /something").unwrap();
+        assert_eq!(c.context, CommandContext::Queue);
+        assert_eq!(c.address, "/something");
+        assert!(c.args.is_empty());
+    }
+
+    // -- parse_filter --
+
+    #[test]
+    fn test_parse_filter_basic() {
+        let f = parse_filter(">>> drums bass keys").unwrap();
+        assert_eq!(f.groups, vec!["drums", "bass", "keys"]);
+    }
+
+    #[test]
+    fn test_parse_filter_empty() {
+        let f = parse_filter(">>>").unwrap();
+        assert!(f.groups.is_empty());
+    }
+
+    // -- Integration: parse from GroupedBillboard --
+
+    #[test]
+    fn test_parse_integration() {
+        let source = "\
+# header
+>>> drums bass
+
+COMMAND /set_bpm 120
+DEFAULT amp0.5
+
+*@SP_Roland808:drums ofs0 1:0 2:14
+14 14 26 32
+€reverb:main room0.9
+
+@moogBass:bass
+<harmony; amp*1.5> c4 d4
+";
+        let classified = classify_source(source);
+        let grouped = group_sections(&classified);
+
+        // Filters
+        let filters = parse_all_filters(&grouped);
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].as_ref().unwrap().groups, vec!["drums", "bass"]);
+
+        // Commands
+        let cmds = parse_all_commands(&grouped);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].as_ref().unwrap().address, "/set_bpm");
+
+        // Section 0: sampler
+        let h0 = parse_synth_header(&grouped.sections[0].header.content).unwrap();
+        assert!(h0.is_sampler);
+        assert!(h0.is_selected);
+        assert_eq!(h0.instrument, "Roland808");
+
+        let eff0 = parse_section_effects(&grouped.sections[0]);
+        assert_eq!(eff0.len(), 1);
+        assert_eq!(eff0[0].as_ref().unwrap().effect_type, "reverb");
+
+        // Section 1: bass
+        let h1 = parse_synth_header(&grouped.sections[1].header.content).unwrap();
+        assert_eq!(h1.instrument, "moogBass");
+        assert_eq!(h1.group, Some("bass".to_string()));
+
+        let meta = parse_track_metadata(&grouped.sections[1].tracks[0].content);
+        assert!(meta.is_some());
+        assert_eq!(meta.unwrap().group_override, Some("harmony".to_string()));
     }
 
     #[test]
