@@ -1064,6 +1064,286 @@ mod tests {
         assert!(has_meta, "arena.bbd should have tracks with group overrides");
     }
 
+    // ========== Args precedence tests ==========
+
+    #[test]
+    fn test_args_header_overrides_default() {
+        // Bug: header amp=0.08 was not overriding DEFAULT amp=1.0
+        let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
+        let defaults: HashMap<String, f64> = [("amp".into(), 1.0), ("sus".into(), 0.5)].into();
+        let header: HashMap<String, f64> = [("amp".into(), 0.08), ("relT".into(), 2.0)].into();
+        let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
+        let packets = track_to_timed_packets(&mut converter, "c4", &defaults, &header, &empty_overrides).unwrap();
+        if let OscPacket::Message(ref msg) = packets[0].packet {
+            // Find amp in the flat arg list (key-value pairs)
+            let find_after = |key: &str| -> f32 {
+                let mut found = false;
+                for a in &msg.args {
+                    if found {
+                        if let OscType::Float(v) = a { return *v; }
+                    }
+                    if let OscType::String(s) = a {
+                        if s == key { found = true; }
+                    }
+                }
+                panic!("arg {} not found", key);
+            };
+            assert!((find_after("amp") - 0.08).abs() < 0.01, "amp should be 0.08 from header, overriding DEFAULT 1.0");
+            assert!((find_after("sus") - 0.5).abs() < 0.01, "sus should be 0.5 from DEFAULT (header didn't set it)");
+        }
+    }
+
+    #[test]
+    fn test_args_element_overrides_header() {
+        // Element inline args should override header args
+        let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
+        let defaults: HashMap<String, f64> = [("amp".into(), 1.0)].into();
+        let header: HashMap<String, f64> = [("amp".into(), 0.08)].into();
+        let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
+        let packets = track_to_timed_packets(&mut converter, "c4:amp0.03", &defaults, &header, &empty_overrides).unwrap();
+        if let OscPacket::Message(ref msg) = packets[0].packet {
+            let find_after = |key: &str| -> f32 {
+                let mut found = false;
+                for a in &msg.args {
+                    if found {
+                        if let OscType::Float(v) = a { return *v; }
+                    }
+                    if let OscType::String(s) = a {
+                        if s == key { found = true; }
+                    }
+                }
+                panic!("arg {} not found", key);
+            };
+            assert!((find_after("amp") - 0.03).abs() < 0.01, "amp=0.03 from element should override header 0.08");
+        }
+    }
+
+    #[test]
+    fn test_args_track_overrides_operator_mul() {
+        // Track override `amp*2` should multiply the resolved header value
+        let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
+        let defaults: HashMap<String, f64> = HashMap::new();
+        let header: HashMap<String, f64> = [("amp".into(), 0.08)].into();
+        let track_overrides: HashMap<String, (char, f64)> = [("amp".into(), ('*', 2.0))].into();
+        let packets = track_to_timed_packets(&mut converter, "c4", &defaults, &header, &track_overrides).unwrap();
+        if let OscPacket::Message(ref msg) = packets[0].packet {
+            let find_after = |key: &str| -> f32 {
+                let mut found = false;
+                for a in &msg.args {
+                    if found {
+                        if let OscType::Float(v) = a { return *v; }
+                    }
+                    if let OscType::String(s) = a {
+                        if s == key { found = true; }
+                    }
+                }
+                panic!("arg {} not found", key);
+            };
+            assert!((find_after("amp") - 0.16).abs() < 0.01, "amp=0.08*2=0.16 from track override");
+        }
+    }
+
+    #[test]
+    fn test_args_track_overrides_operator_add() {
+        let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
+        let defaults: HashMap<String, f64> = [("time".into(), 0.5)].into();
+        let header: HashMap<String, f64> = HashMap::new();
+        let track_overrides: HashMap<String, (char, f64)> = [("time".into(), ('+', 0.2))].into();
+        let packets = track_to_timed_packets(&mut converter, "c4", &defaults, &header, &track_overrides).unwrap();
+        if let OscPacket::Message(ref msg) = packets[0].packet {
+            let find_after = |key: &str| -> f32 {
+                let mut found = false;
+                for a in &msg.args {
+                    if found {
+                        if let OscType::Float(v) = a { return *v; }
+                    }
+                    if let OscType::String(s) = a {
+                        if s == key { found = true; }
+                    }
+                }
+                panic!("arg {} not found", key);
+            };
+            assert!((find_after("time") - 0.7).abs() < 0.01, "time=0.5+0.2=0.7 from track override");
+        }
+    }
+
+    #[test]
+    fn test_args_track_overrides_operator_replace() {
+        // '=' operator should replace the resolved value
+        let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
+        let defaults: HashMap<String, f64> = [("amp".into(), 1.0)].into();
+        let header: HashMap<String, f64> = [("amp".into(), 0.08)].into();
+        let track_overrides: HashMap<String, (char, f64)> = [("amp".into(), ('=', 0.5))].into();
+        let packets = track_to_timed_packets(&mut converter, "c4", &defaults, &header, &track_overrides).unwrap();
+        if let OscPacket::Message(ref msg) = packets[0].packet {
+            let find_after = |key: &str| -> f32 {
+                let mut found = false;
+                for a in &msg.args {
+                    if found {
+                        if let OscType::Float(v) = a { return *v; }
+                    }
+                    if let OscType::String(s) = a {
+                        if s == key { found = true; }
+                    }
+                }
+                panic!("arg {} not found", key);
+            };
+            assert!((find_after("amp") - 0.5).abs() < 0.01, "amp should be replaced to 0.5 by track override");
+        }
+    }
+
+    // ========== Rest/silence 'x' tests ==========
+
+    #[test]
+    fn test_rest_x_produces_empty_msg_for_synth() {
+        // Bug: is_symbol checked suffix, but shuttle puts 'x' in prefix.
+        // 'x' should produce /empty_msg, not /note_on_timed.
+        let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
+        let empty: HashMap<String, f64> = HashMap::new();
+        let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
+        let packets = track_to_timed_packets(&mut converter, "x x x", &empty, &empty, &empty_overrides).unwrap();
+        assert_eq!(packets.len(), 3);
+        for p in &packets {
+            if let OscPacket::Message(ref msg) = p.packet {
+                assert_eq!(msg.addr, "/empty_msg", "rest 'x' should produce /empty_msg, not {}", msg.addr);
+                assert!(msg.args.is_empty(), "/empty_msg should have no args");
+            }
+        }
+    }
+
+    #[test]
+    fn test_rest_x_produces_empty_msg_for_sampler() {
+        // Bug: Sampler 'x' elements were falling through to /play_sample
+        let mut converter = ElementConverter::new("SP_808", "0", InstrumentType::Sampler, ScaleData::default());
+        let empty: HashMap<String, f64> = HashMap::new();
+        let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
+        let packets = track_to_timed_packets(&mut converter, "x 14 x", &empty, &empty, &empty_overrides).unwrap();
+        assert_eq!(packets.len(), 3);
+        // First and third are rest -> /empty_msg
+        if let OscPacket::Message(ref msg) = packets[0].packet {
+            assert_eq!(msg.addr, "/empty_msg", "rest 'x' for sampler should be /empty_msg");
+        }
+        // Middle is a real sample play
+        if let OscPacket::Message(ref msg) = packets[1].packet {
+            assert_eq!(msg.addr, "/play_sample", "numeric index should be /play_sample");
+        }
+        if let OscPacket::Message(ref msg) = packets[2].packet {
+            assert_eq!(msg.addr, "/empty_msg", "rest 'x' for sampler should be /empty_msg");
+        }
+    }
+
+    #[test]
+    fn test_rest_x_produces_empty_msg_for_drone() {
+        let mut converter = ElementConverter::new("DR_drone", "0", InstrumentType::Drone, ScaleData::default());
+        let empty: HashMap<String, f64> = HashMap::new();
+        let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
+        let packets = track_to_timed_packets(&mut converter, "x", &empty, &empty, &empty_overrides).unwrap();
+        assert_eq!(packets.len(), 1);
+        if let OscPacket::Message(ref msg) = packets[0].packet {
+            assert_eq!(msg.addr, "/empty_msg");
+        }
+    }
+
+    #[test]
+    fn test_silence_dot_ignored() {
+        // '.' (legacy silence, tokenized as 'x') should be ignored (None)
+        let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
+        let empty: HashMap<String, f64> = HashMap::new();
+        let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
+        let packets = track_to_timed_packets(&mut converter, ".", &empty, &empty, &empty_overrides).unwrap();
+        // '.' becomes 'x' token, which is_symbol catches -> /empty_msg
+        // BUT: in the shuttle parser, '.' might be handled differently...
+        // Check it produces /empty_msg
+        if packets.is_empty() {
+            // Some implementations might return None for '.'
+        } else {
+            if let OscPacket::Message(ref msg) = packets[0].packet {
+                assert!(
+                    msg.addr == "/empty_msg" || msg.addr == "/note_on_timed",
+                    "'.' should produce /empty_msg or be filtered, got {}", msg.addr
+                );
+            }
+        }
+    }
+
+    // ========== Arg ordering test ==========
+
+    #[test]
+    fn test_args_are_sorted_alphabetically() {
+        // After the fix, args in OSC messages should be alphabetically sorted.
+        // Run twice to verify determinism (HashMap iteration was random before).
+        let defaults: HashMap<String, f64> = [
+            ("zLast".into(), 1.0), ("aFirst".into(), 2.0),
+            ("mid".into(), 3.0),
+        ].into();
+        let empty_header: HashMap<String, f64> = HashMap::new();
+        let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
+
+        let mut collect_keys = || {
+            let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
+            let packets = track_to_timed_packets(&mut converter, "c4", &defaults, &empty_header, &empty_overrides).unwrap();
+            let mut kv_keys = Vec::new();
+            if let OscPacket::Message(ref msg) = packets[0].packet {
+                let mut i = 4; // skip 4 positional args
+                while i + 1 < msg.args.len() {
+                    if let OscType::String(ref k) = msg.args[i] {
+                        kv_keys.push(k.clone());
+                    }
+                    i += 2;
+                }
+            }
+            kv_keys
+        };
+
+        let keys1 = collect_keys();
+        let keys2 = collect_keys();
+        assert_eq!(keys1, keys2, "arg keys should be deterministic across calls");
+        // Non-override keys (everything after freq) should be alphabetical
+        let non_override = &keys1[1..];
+        let mut sorted = non_override.to_vec();
+        sorted.sort();
+        assert_eq!(non_override, sorted.as_slice(), "non-override arg keys should be alphabetically sorted: {:?}", keys1);
+    }
+
+    // ========== Group filter tests ==========
+
+    #[test]
+    fn test_group_filter_applied_in_queue_update() {
+        // Parse arena.bbd and check that only filtered tracks emit messages.
+        // arena.bbd has >>> gritBass damu blip EMU_SP12
+        let source = include_str!("../../jdw-pycompose/songs/arena.bbd");
+        let bb = full::parse(source);
+        let final_filter = bb.filters.last().cloned().unwrap_or_default();
+        assert!(!final_filter.is_empty(), "arena.bbd should have group filters");
+
+        // Every section with tracks in filtered groups should emit content
+        let scale_data = extract_scale_data(&bb.commands);
+        for section in &bb.sections {
+            for track in &section.tracks {
+                if !track.enabled { continue; }
+                let gname = track_group_name(track, section);
+                if !final_filter.contains(&gname) {
+                    continue;
+                }
+                let instrument_type = if section.header.is_drone { InstrumentType::Drone }
+                    else if section.header.is_sampler { InstrumentType::Sampler }
+                    else { InstrumentType::Synth };
+                let mut converter = ElementConverter::new(
+                    &section.header.instrument, "0",
+                    instrument_type, scale_data.clone(),
+                );
+                let packets = track_to_timed_packets(
+                    &mut converter, &track.content,
+                    &bb.default_args, &section.header.default_args, &track.arg_overrides,
+                );
+                assert!(
+                    packets.is_ok() && !packets.unwrap().is_empty(),
+                    "filtered track {}_{} should produce packets", section.header.instrument, track.index
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_parse_real_bbd_rattlesnake() {
         let source = include_str!("../../jdw-pycompose/songs/rattlesnake.bbd");

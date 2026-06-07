@@ -89,8 +89,8 @@ Port `nrt_scoring.py` (Score class) and `listener.py` (OSC response listener):
 ## Tests
 
 ```
-cargo test                          # 117 library tests
+cargo test                          # 128 library tests
 cargo test --test integration       # 5 integration tests (16 .bbd files)
 ```
 
-All 122 tests passing.
+All 133 tests passing.
