@@ -1285,12 +1285,46 @@ pub fn get_nrt_record_bundles(
         let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
         let file_name = format!("/home/{}/jdw_output/track_{}.wav", user, track_name);
 
-        // Build NRT bundles from the OSC packets
+        // Build setup messages (commands + effects at t=0) for preload bundle
+        let mut setup_packets: Vec<TimedOSCPacket> = Vec::new();
+        // Commands at t=0
+        for cmd in &billboard.commands {
+            let args: Vec<OscType> = cmd.args.iter().map(|a| osc_arg_from_str(a)).collect();
+            setup_packets.push(TimedOSCPacket {
+                time: f64_to_bigdecimal(0.0),
+                packet: OscPacket::Message(OscMessage {
+                    addr: cmd.address.clone(),
+                    args,
+                }),
+            });
+        }
+        // Effects as t=0 /note_on messages
+        for section in &billboard.sections {
+            if section.header.instrument == meta.instrument_name {
+                for effect in &section.effects {
+                    let ext_id = format!("effect_{}_{}", section.header.group.as_deref().unwrap_or(""), effect.id);
+                    let mut args = vec![
+                        OscType::String(effect.effect_type.clone()),
+                        OscType::String(ext_id),
+                        OscType::Int(0),
+                    ];
+                    args.extend(args_as_osc(&effect.args, &[]));
+                    setup_packets.push(TimedOSCPacket {
+                        time: f64_to_bigdecimal(0.0),
+                        packet: OscPacket::Message(OscMessage {
+                            addr: "/note_on".to_string(),
+                            args,
+                        }),
+                    });
+                }
+            }
+        }
+
         results.push(NrtBundleInfo {
             track_name: track_name.clone(),
             nrt_bundle: build_nrt_record_bundle_from_packets(&osc_packets, bpm, &file_name, end_beat),
             preload_messages: preload_msgs,
-            preload_bundles: vec![build_nrt_preload_bundle_from_packets(&osc_packets)],
+            preload_bundles: vec![build_nrt_preload_bundle_from_packets(&setup_packets)],
         });
     }
 
