@@ -1223,11 +1223,25 @@ pub fn get_nrt_record_bundles(
         let mut preload_msgs = vec![OscPacket::Message(OscMessage {
             addr: "/clear_nrt".to_string(), args: vec![],
         })];
+        // Filter synthdefs: only needed ones (track's instrument + samplerALT + effects)
+        let mut needed_synth_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        needed_synth_names.insert(meta.instrument_name.as_str());
+        needed_synth_names.insert("samplerALT"); // always needed for NRT sample playback
+        // Also include any synths used by this section's effects
+        for section in &billboard.sections {
+            if section.header.instrument == meta.instrument_name {
+                for effect in &section.effects {
+                    needed_synth_names.insert(effect.effect_type.as_str());
+                }
+            }
+        }
         for def in synthdefs {
-            preload_msgs.push(OscPacket::Message(OscMessage {
-                addr: "/create_synthdef".to_string(),
-                args: vec![OscType::String(def.content.clone())],
-            }));
+            if needed_synth_names.contains(def.name.as_str()) {
+                preload_msgs.push(OscPacket::Message(OscMessage {
+                    addr: "/create_synthdef".to_string(),
+                    args: vec![OscType::String(def.content.clone())],
+                }));
+            }
         }
         for sm in samples {
             preload_msgs.push(OscPacket::Message(OscMessage {
