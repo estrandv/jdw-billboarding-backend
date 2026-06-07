@@ -100,7 +100,7 @@ them should have extended durations.
 **Test:** `test_score_unpack_empty_messages` — pure silence entries should
 produce `/empty_message` bundles.
 
-## Phase 2 — NRT Bundle Builders (src/osc.rs)
+## Phase 2 — NRT Bundle Builders (src/osc.rs) ✅ DONE
 
 ### Bundle Formats
 
@@ -148,7 +148,7 @@ the BPM from a `/set_bpm` command.
 **Test:** `test_nrt_record_bundles_filtered_samples` — verify only samples
 used by the track are preloaded (not all samples).
 
-## Phase 3 — Listener (src/listener.rs)
+## Phase 3 — Listener (src/listener.rs) ✅ DONE
 
 Port Python's `Listener` class — a blocking wait for NRT completion.
 
@@ -181,7 +181,7 @@ never arrives should timeout after N seconds.
 **Test:** `test_listener_wait_for_receives` — sending the expected address
 should unblock wait_for.
 
-## Phase 4 — Wire into jdw-suite
+## Phase 4 — Wire into jdw-suite ✅ DONE
 
 ### Stage 4a — NRT entry point
 
