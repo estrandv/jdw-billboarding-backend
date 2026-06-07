@@ -86,7 +86,6 @@ impl Score {
         {
             let src = &self.track_sources[&longest_name];
             let track = self.tracks.get_mut(&longest_name).unwrap();
-            track.clear();
             for idx in 0..src.durations.len() {
                 track.push(ScoreMessage {
                     source_index: Some(idx),
@@ -102,10 +101,9 @@ impl Score {
             let src = self.track_sources[name].clone();
             let src_duration: f64 = src.durations.iter().sum();
             let track = self.tracks.get_mut(name).unwrap();
-            track.clear();
 
-            let mut current_time = 0.0f64;
-            let mut remaining = goal_time;
+            let mut current_time: f64 = track.iter().map(|m| m.time).sum();
+            let mut remaining = goal_time - current_time;
 
             while remaining >= src_duration && src_duration > 0.0 {
                 for idx in 0..src.durations.len() {
