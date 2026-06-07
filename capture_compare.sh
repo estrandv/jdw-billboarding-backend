@@ -50,8 +50,27 @@ else
     warn "Setup pcap might be empty or missing!"
 fi
 
-# ---- Phase 2: Play (queue update) ----
-header "Phase 2: Python PLAY"
+# ---- Phase 2: Update/Configure (commands + effects + drones) ----
+header "Phase 2: Python UPDATE (configure)"
+info "Song: $SONG"
+echo ""
+echo "RUN THIS IN A SEPARATE TERMINAL:"
+echo "  sudo tcpdump -i lo -U -w $TMPDIR/update.pcap udp port $PCAP_PORT"
+echo ""
+read -p "Press ENTER when tcpdump is running, then run in another terminal:" _
+echo ""
+echo "  cd $PYCOMPOSE && python3 run.py --update \"$SONG\""
+echo ""
+read -p "Press ENTER when the Python update command has completed, then Ctrl+C tcpdump:" _
+
+if [[ -f "$TMPDIR/update.pcap" ]] && [[ $(stat -c%s "$TMPDIR/update.pcap" 2>/dev/null) -gt 40 ]]; then
+    info "Update pcap captured ($(stat -c%s "$TMPDIR/update.pcap") bytes)"
+else
+    warn "Update pcap might be empty or missing!"
+fi
+
+# ---- Phase 3: Play (queue update) ----
+header "Phase 3: Python PLAY"
 echo ""
 echo "RUN THIS IN A SEPARATE TERMINAL:"
 echo "  sudo tcpdump -i lo -U -w $TMPDIR/play.pcap udp port $PCAP_PORT"
@@ -74,6 +93,10 @@ header "Parsing captures"
 info "Parsing setup pcap..."
 python3 "$SCRIPT_DIR/parse_osc_dump.py" --compact < "$TMPDIR/setup.pcap" > "$TMPDIR/python_setup.txt" 2>/dev/null || warn "Setup parse failed (maybe empty)"
 echo "  Python setup: $(wc -l < "$TMPDIR/python_setup.txt" 2>/dev/null || echo 0) messages"
+
+info "Parsing update pcap..."
+python3 "$SCRIPT_DIR/parse_osc_dump.py" --compact < "$TMPDIR/update.pcap" > "$TMPDIR/python_update.txt" 2>/dev/null || warn "Update parse failed (maybe empty)"
+echo "  Python update: $(wc -l < "$TMPDIR/python_update.txt" 2>/dev/null || echo 0) messages"
 
 info "Parsing play pcap..."
 python3 "$SCRIPT_DIR/parse_osc_dump.py" --compact < "$TMPDIR/play.pcap" > "$TMPDIR/python_play.txt" 2>/dev/null
@@ -103,18 +126,18 @@ header "Quick Comparison"
 echo ""
 echo "File           | Messages"
 echo "---------------|----------"
-for f in python_setup python_play rust_setup rust_commands rust_play; do
+for f in python_setup python_update python_play rust_setup rust_commands rust_play; do
     if [[ -f "$TMPDIR/${f}.txt" ]]; then
         printf "%-15s| %s\n" "$f" "$(wc -l < "$TMPDIR/${f}.txt")"
     fi
 done
 
 echo ""
-info "Comparing play phase message counts by type..."
+info "Message type breakdowns..."
 
 # Address counts
 count_by_addr() {
-    awk '{print $1}' "$1" | sort | uniq -c | sort -rn | head -10
+    awk '{print $1}' "$1" | sort | uniq -c | sort -rn | head -15
 }
 
 echo ""
@@ -122,32 +145,36 @@ echo "=== Python SETUP message types ==="
 count_by_addr "$TMPDIR/python_setup.txt" 2>/dev/null
 
 echo ""
-echo "=== Python PLAY message types ==="
-count_by_addr "$TMPDIR/python_play.txt"
+echo "=== Python UPDATE message types ==="
+count_by_addr "$TMPDIR/python_update.txt" 2>/dev/null
 
 echo ""
-echo "=== Rust PLAY message types ==="
-grep '^  \[' "$TMPDIR/rust_play.txt" | grep -oP '/\S+' | sort | uniq -c | sort -rn
+echo "=== Python PLAY message types ==="
+count_by_addr "$TMPDIR/python_play.txt"
 
 echo ""
 echo "=== Rust COMMANDS message types ==="
 grep '^  \[' "$TMPDIR/rust_commands.txt" | grep -oP '/\S+' | sort | uniq -c | sort -rn
 
 echo ""
+echo "=== Rust PLAY message types ==="
+grep '^  \[' "$TMPDIR/rust_play.txt" | grep -oP '/\S+' | sort | uniq -c | sort -rn
+
+echo ""
 info "Full dump files saved in: $TMPDIR"
-echo "  python_setup.txt   - Python setup/configure messages"
-echo "  python_play.txt    - Python play messages"
+echo "  python_setup.txt   - Python synthdef loads + configure"
+echo "  python_update.txt  - Python configure only (effects, drones, commands)"
+echo "  python_play.txt    - Python queue update (notes)"
 echo "  rust_setup.txt     - Rust synthdef setup"
-echo "  rust_commands.txt  - Rust commands (configure)"
-echo "  rust_play.txt      - Rust queue update (play)"
+echo "  rust_commands.txt  - Rust billboard commands"
+echo "  rust_play.txt      - Rust queue update (notes)"
 echo ""
-info "To diff play phase (the main comparison):"
-echo "  # Extract just play messages from Python:"
-echo "  grep -E '/note_on_timed|/play_sample|/note_on|/empty_msg' $TMPDIR/python_play.txt > $TMPDIR/py_play_only.txt"
-echo "  # Normalize Rust play messages:"
-echo "  python3 $SCRIPT_DIR/normalize_rust_dump.py < $TMPDIR/rust_play.txt > $TMPDIR/rs_play_norm.txt"
+info "Key comparisons to make:"
+echo "  # Compare Python UPDATE (effects + drones) vs Rust COMMANDS:"
+echo "  diff <(awk '{print \$1}' $TMPDIR/python_update.txt | sort) \\"
+echo "       <(grep '^  \[' $TMPDIR/rust_commands.txt | grep -oP '/\\S+' | sort)"
 echo ""
-info "To see Rust vs Python side by side for available messages, run:"
+info "To see all Rust dumps:"
 echo "  cd $SCRIPT_DIR"
 echo "  cargo run --example dump_osc -- --phase all \"$SONG\""
 
