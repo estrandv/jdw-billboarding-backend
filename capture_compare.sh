@@ -3,13 +3,14 @@
 # Usage: ./capture_compare.sh [song.bbd]
 # Default: arena.bbd from jdw-pycompose
 #
-# Requires: sudo tcpdump, mypython, cargo
+# Requires: sudo tcpdump, $MYPYTHON, cargo
 # Runs: setup → update → play in one shot with a single sudo tcpdump.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYCOMPOSE="/home/estrandv/programming/jdw-pycompose"
+MYPYTHON="$HOME/mypython/bin/python"
 SONG="${1:-$PYCOMPOSE/songs/arena.bbd}"
 SONG_NAME="$(basename "$SONG")"
 TMPDIR="/tmp/osc_compare_$$"
@@ -35,7 +36,7 @@ sleep 0.5  # let tcpdump initialize
 
 # ---- Tiny sentinel helper (valid OSC /phase_marker message) ----
 send_marker() {
-    mypython -c "
+    $MYPYTHON -c "
 import socket, struct, sys
 tag = sys.argv[1] if len(sys.argv)>1 else '?'
 addr = b'/phase_marker\x00\x00'
@@ -50,19 +51,19 @@ sock.close()
 # ---- Phase 1: SETUP ----
 info "Phase 1: SETUP"
 send_marker setup_start
-(cd "$PYCOMPOSE" && mypython run.py --setup "$SONG")
+(cd "$PYCOMPOSE" && $MYPYTHON run.py --setup "$SONG")
 sleep 1
 
 # ---- Phase 2: UPDATE ----
 info "Phase 2: UPDATE"
 send_marker update_start
-(cd "$PYCOMPOSE" && mypython run.py --update "$SONG")
+(cd "$PYCOMPOSE" && $MYPYTHON run.py --update "$SONG")
 sleep 1
 
 # ---- Phase 3: PLAY ----
 info "Phase 3: PLAY"
 send_marker play_start
-(cd "$PYCOMPOSE" && mypython run.py "$SONG")
+(cd "$PYCOMPOSE" && $MYPYTHON run.py "$SONG")
 sleep 1
 
 # ---- Stop capture ----
@@ -74,12 +75,12 @@ info "Capture complete ($(stat -c%s "$PCAP" 2>/dev/null || echo 0) bytes)"
 
 # ---- Parse pcap and split by phase markers ----
 header "Parsing capture"
-mypython "$SCRIPT_DIR/parse_osc_dump.py" --compact < "$PCAP" > "$TMPDIR/all.txt" 2>/dev/null
+$MYPYTHON "$SCRIPT_DIR/parse_osc_dump.py" --compact < "$PCAP" > "$TMPDIR/all.txt" 2>/dev/null
 ALL_MSGS=$(wc -l < "$TMPDIR/all.txt" 2>/dev/null || echo 0)
 info "Total messages captured: $ALL_MSGS"
 
 # ---- Split by phase markers ----
-mypython -c "
+$MYPYTHON -c "
 import sys
 lines = open('$TMPDIR/all.txt').readlines()
 
