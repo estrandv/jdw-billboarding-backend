@@ -8,6 +8,10 @@ description = "Billboard notation parser and OSC converter for JackDAW"
 name = "jdw_billboarding_backend"
 path = "src/lib.rs"
 
+[[bin]]
+name = "jdw"
+path = "src/main.rs"
+
 [dependencies]
 rosc = "0.10.1"
 bigdecimal = "0.4.2"
