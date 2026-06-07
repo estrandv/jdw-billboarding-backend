@@ -6,6 +6,7 @@ pub mod config;
 pub mod note_utils;
 pub mod osc;
 pub mod synthdefs;
+pub mod sample_loader;
 
 pub use full::{
     Billboard, BillboardCommand, CommandContext, EffectDefinition, SynthHeader, SynthSection,
@@ -13,6 +14,7 @@ pub use full::{
 };
 pub use osc::{dump_queue_update, dump_setup, dump_commands, OscConfig};
 pub use synthdefs::{load_synthdefs, SynthDefMessage};
+pub use sample_loader::{get_default_samples, SampleLoadMessage, Sample};
 pub use macros::{compile_macros, load_and_expand};
 
 /// Parse a billboard file from a string (raw, no macro expansion).

@@ -397,6 +397,91 @@ pub fn send_silence_drones(billboard: &full::Billboard, config: &OscConfig) -> R
     Ok(())
 }
 
+/// Clear all existing effects before creating new ones.
+/// Matches Python's `get_effects_clear()` → `/free_notes "^effect_(.*)"`
+pub fn send_effects_clear(config: &OscConfig) -> Result<(), String> {
+    let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
+    let msg = OscPacket::Message(OscMessage {
+        addr: "/free_notes".to_string(),
+        args: vec![OscType::String("^effect_(.*)".to_string())],
+    });
+    send_to_router(&sock, &config.router_addr, &msg)
+}
+
+/// Create all `€`-defined effects via `/note_on`.
+/// Matches Python's `get_all_effects_create()`.
+pub fn send_effects_create(billboard: &full::Billboard, config: &OscConfig) -> Result<(), String> {
+    let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
+
+    for section in &billboard.sections {
+        let group_name = section.header.group.as_deref().unwrap_or("");
+        for effect in &section.effects {
+            let ext_id = format!("effect_{}_{}", group_name, effect.id);
+            let mut args = vec![
+                OscType::String(effect.effect_type.clone()),
+                OscType::String(ext_id),
+                OscType::Int(0), // delay
+            ];
+            args.extend(args_as_osc(&effect.args, &[]));
+            let msg = OscPacket::Message(OscMessage {
+                addr: "/note_on".to_string(),
+                args,
+            });
+            send_to_router(&sock, &config.router_addr, &msg)?;
+            std::thread::sleep(Duration::from_millis(DELAY_CONFIGURE_MS));
+        }
+    }
+    Ok(())
+}
+
+/// Create drone synth nodes (amp=0, modulated later) via `/note_on`.
+/// Matches Python's `get_all_drones_create()`.
+pub fn send_drones_create(billboard: &full::Billboard, config: &OscConfig) -> Result<(), String> {
+    let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
+
+    for section in &billboard.sections {
+        if !section.header.is_drone {
+            continue;
+        }
+        let group_name = section.header.group.as_deref().unwrap_or("");
+        for track in &section.tracks {
+            let ext_id = format!("effect_{}_{}", group_name, track.index);
+            let mut args = vec![
+                OscType::String(section.header.instrument.clone()),
+                OscType::String(ext_id),
+                OscType::Int(0),
+            ];
+            // Drone args: start with section defaults, then track overrides, then force amp=0
+            let mut merged = section.header.default_args.clone();
+            for (k, &(op, v)) in &track.arg_overrides {
+                let entry = merged.entry(k.clone()).or_insert(0.0);
+                match op { '*' => *entry *= v, '+' => *entry += v, '-' => *entry -= v, _ => *entry = v }
+            }
+            merged.insert("amp".to_string(), 0.0); // force amp=0 for drone creation
+            args.extend(args_as_osc(&merged, &[]));
+            let msg = OscPacket::Message(OscMessage {
+                addr: "/note_on".to_string(),
+                args,
+            });
+            send_to_router(&sock, &config.router_addr, &msg)?;
+            std::thread::sleep(Duration::from_millis(DELAY_CONFIGURE_MS));
+        }
+    }
+    Ok(())
+}
+
+/// Convert args HashMap to flat key-value OSC args (unfiltered, no overrides).
+fn flat_kv_args(args: &std::collections::HashMap<String, f64>) -> Vec<OscType> {
+    let mut out = Vec::new();
+    let mut keys: Vec<&String> = args.keys().collect();
+    keys.sort();
+    for k in keys {
+        out.push(OscType::String(k.clone()));
+        out.push(OscType::Float(args[k] as f32));
+    }
+    out
+}
+
 // -- Internal helpers --
 
 fn send_to_router(sock: &UdpSocket, addr: &str, packet: &OscPacket) -> Result<(), String> {
@@ -456,6 +541,25 @@ pub fn send_full_setup(
         });
         send_to_router(&sock, &config.router_addr, &msg)?;
         // Delay between messages to prevent dropped packets (matches Python)
+        std::thread::sleep(Duration::from_millis(DELAY_CONFIGURE_MS));
+    }
+
+    Ok(())
+}
+
+/// Send `/load_sample` messages for all discovered samples.
+pub fn send_samples(
+    samples: &[crate::sample_loader::SampleLoadMessage],
+    config: &OscConfig,
+) -> Result<(), String> {
+    let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
+
+    for sm in samples {
+        let msg = OscPacket::Message(OscMessage {
+            addr: "/load_sample".to_string(),
+            args: sm.osc_args.clone(),
+        });
+        send_to_router(&sock, &config.router_addr, &msg)?;
         std::thread::sleep(Duration::from_millis(DELAY_CONFIGURE_MS));
     }
 
@@ -856,12 +960,74 @@ pub fn send_full_commands(
     let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
 
     for cmd in &billboard.commands {
-        let args: Vec<OscType> = cmd.args.iter().map(|a| osc_arg_from_str(a)).collect();
-        let msg = OscPacket::Message(OscMessage {
-            addr: cmd.address.clone(),
-            args,
-        });
-        send_to_router(&sock, &config.router_addr, &msg)?;
+        match cmd.address.as_str() {
+            "/create_router" => {
+                // Transform: /create_router → /note_on "router" "effect_router_{in}_{out}" 0 "in" <in> "out" <out>
+                if cmd.args.len() >= 2 {
+                    let in_arg = &cmd.args[0];
+                    let out_arg = &cmd.args[1];
+                    let ext_id = format!("effect_router_{}_{}", in_arg, out_arg);
+                    let msg = OscPacket::Message(OscMessage {
+                        addr: "/note_on".to_string(),
+                        args: vec![
+                            OscType::String("router".to_string()),
+                            OscType::String(ext_id),
+                            OscType::Int(0),
+                            OscType::String("in".to_string()),
+                            osc_arg_from_str(in_arg),
+                            OscType::String("out".to_string()),
+                            osc_arg_from_str(out_arg),
+                        ],
+                    });
+                    send_to_router(&sock, &config.router_addr, &msg)?;
+                }
+            }
+            "/create_effect" => {
+                // Transform: /create_effect → /note_on + /note_modify
+                if cmd.args.len() >= 3 {
+                    let effect_name = &cmd.args[0];
+                    let effect_id = &cmd.args[1];
+                    let effect_args_str = &cmd.args[2];
+                    // /note_on
+                    let note_on_msg = OscPacket::Message(OscMessage {
+                        addr: "/note_on".to_string(),
+                        args: vec![
+                            OscType::String(effect_name.clone()),
+                            OscType::String(effect_id.clone()),
+                            OscType::Int(0),
+                        ],
+                    });
+                    send_to_router(&sock, &config.router_addr, &note_on_msg)?;
+                    std::thread::sleep(Duration::from_millis(DELAY_CONFIGURE_MS));
+                    // /note_modify — parse the args string as comma-separated key=val
+                    let parsed = crate::full::parse_simple_args(effect_args_str);
+                    let mut mod_args = vec![
+                        OscType::String(effect_id.clone()),
+                        OscType::Int(0),
+                    ];
+                    let mut pairs: Vec<(&String, &String)> = parsed.iter().map(|(k,v)| (k,v)).collect();
+                    pairs.sort_by(|a, b| a.0.cmp(b.0));
+                    for (k, v) in pairs {
+                        mod_args.push(OscType::String(k.clone()));
+                        mod_args.push(osc_arg_from_str(v));
+                    }
+                    let mod_msg = OscPacket::Message(OscMessage {
+                        addr: "/note_modify".to_string(),
+                        args: mod_args,
+                    });
+                    send_to_router(&sock, &config.router_addr, &mod_msg)?;
+                }
+            }
+            _ => {
+                // Pass-through: all other commands sent verbatim
+                let args: Vec<OscType> = cmd.args.iter().map(|a| osc_arg_from_str(a)).collect();
+                let msg = OscPacket::Message(OscMessage {
+                    addr: cmd.address.clone(),
+                    args,
+                });
+                send_to_router(&sock, &config.router_addr, &msg)?;
+            }
+        }
         std::thread::sleep(Duration::from_millis(DELAY_CONFIGURE_MS));
     }
 
@@ -872,11 +1038,16 @@ pub fn send_full_commands(
 pub fn send_full_billboard(
     billboard: &full::Billboard,
     synthdefs: &[crate::synthdefs::SynthDefMessage],
+    samples: &[crate::sample_loader::SampleLoadMessage],
     config: &OscConfig,
 ) -> Result<(), String> {
+    send_samples(samples, config)?;
     send_full_setup(synthdefs, config)?;
-    send_full_queue_update(billboard, config)?;
-    send_full_commands(billboard, config)
+    send_effects_clear(config)?;
+    send_drones_create(billboard, config)?;
+    send_effects_create(billboard, config)?;
+    send_full_commands(billboard, config)?;
+    send_full_queue_update(billboard, config)
 }
 
 #[cfg(test)]

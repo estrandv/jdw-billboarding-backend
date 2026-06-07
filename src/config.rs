@@ -20,6 +20,8 @@ pub struct JdwConfig {
     pub bbd_root: Option<String>,
     pub synthdefs_scd_path: Option<String>,
     pub template_synths_path: Option<String>,
+    pub sample_pack_dir: Option<String>,
+    pub first_buffer_index: u32,
 }
 
 impl Default for JdwConfig {
@@ -35,6 +37,8 @@ impl Default for JdwConfig {
             bbd_root: None,
             synthdefs_scd_path: None,
             template_synths_path: None,
+            sample_pack_dir: Some("~/sample_packs".to_string()),
+            first_buffer_index: 100,
         }
     }
 }
@@ -75,6 +79,12 @@ impl JdwConfig {
             }
             if let Some(v) = py.get("template_synths_path").and_then(|v| v.as_str()) {
                 self.template_synths_path = Some(v.to_string());
+            }
+            if let Some(v) = py.get("sample_pack_dir").and_then(|v| v.as_str()) {
+                self.sample_pack_dir = Some(v.to_string());
+            }
+            if let Some(v) = py.get("first_buffer_index").and_then(|v| v.as_integer()) {
+                self.first_buffer_index = v as u32;
             }
             if let Some(delays) = py.get("delays").and_then(|v| v.as_table()) {
                 if let Some(v) = delays.get("inter_message").and_then(|v| v.as_float()) {
