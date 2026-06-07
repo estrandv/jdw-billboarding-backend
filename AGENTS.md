@@ -75,17 +75,15 @@ logs). But `/nrt_done` never comes back.
 6. Increasing timeouts 30s→120s→300s didn't fix it — not a slowness issue
 
 **Theories (ordered by likelihood):**
-1. **sclang `action:` callback not firing**: The SCD template uses
-   `action: { o.sendMsg("/nrt_done", "ok"); }`. For NRT servers, `o` (the
-   client NetAddr) might not be set correctly, or the NRT render mode doesn't
-   invoke the action callback.
-2. **The `o` socket name**: The config value `server_osc_socket_name = "o"`.
-   In sclang, `o` is a global variable pointing to the default client. After
-   `Server(\nrt, ...)`, does the NRT server still have `o` pointing to jdw-sc?
-3. **Empty preloads cause a different code path in jdw-sc**: Despite tracing
+1. **Score row causing sclang runtime error/hang**: `o.sendMsg` is the same for
+   every SCD (it's in the template, not per-track). Since most tracks work, the
+   problem is in the failing track's specific score rows. Something in those rows
+   causes sclang to abort or hang before reaching the `action:` callback. Compare
+   the Python SCD score rows with Rust's for the same track — find the difference.
+2. **Empty preloads cause a different code path in jdw-sc**: Despite tracing
    showing the same lines execute, maybe `self.nrt_preloads.is_empty()` triggers
    different behavior elsewhere (e.g., `nrt_sample_pack_dict` state).
-4. **sclang parse failure silently ignored**: The SCD might parse but have a
+3. **sclang parse failure silently ignored**: The SCD might parse but have a
    runtime error that prevents the action from firing, with no visible error.
 
 **Investigation plan (tomorrow):**
