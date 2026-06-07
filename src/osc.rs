@@ -967,6 +967,8 @@ pub fn send_full_commands(
                     let in_arg = &cmd.args[0];
                     let out_arg = &cmd.args[1];
                     let ext_id = format!("effect_router_{}_{}", in_arg, out_arg);
+                    let in_val: f32 = in_arg.parse().unwrap_or(0.0);
+                    let out_val: f32 = out_arg.parse().unwrap_or(0.0);
                     let msg = OscPacket::Message(OscMessage {
                         addr: "/note_on".to_string(),
                         args: vec![
@@ -974,9 +976,9 @@ pub fn send_full_commands(
                             OscType::String(ext_id),
                             OscType::Int(0),
                             OscType::String("in".to_string()),
-                            osc_arg_from_str(in_arg),
+                            OscType::Float(in_val),
                             OscType::String("out".to_string()),
-                            osc_arg_from_str(out_arg),
+                            OscType::Float(out_val),
                         ],
                     });
                     send_to_router(&sock, &config.router_addr, &msg)?;
