@@ -1,8 +1,8 @@
 /// Full Billboard Notation parser.
 ///
 /// Stages (per PLAN_full_billboard_parser.md):
-///   Stage 1 — Line classifier + continuation + inline comments   ← current
-///   Stage 2 — Section grouper
+///   Stage 1 — Line classifier + continuation + inline comments
+///   Stage 2 — Section grouper                                    ← current
 ///   Stage 3 — Low-level parsers
 ///   Stage 4 — Billboard construction + argument inheritance
 ///   Stage 5 — OSC conversion
@@ -193,6 +193,129 @@ pub fn classify_source(source: &str) -> Vec<ClassifiedLine> {
     }
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 — Section Grouper
+// ---------------------------------------------------------------------------
+
+/// A group of lines belonging to one synth section.
+#[derive(Debug, Clone)]
+pub struct SectionGroup {
+    pub header: ClassifiedLine,
+    pub tracks: Vec<ClassifiedLine>,
+    pub effects: Vec<ClassifiedLine>,
+    pub comments: Vec<ClassifiedLine>,
+}
+
+/// Top-level parsed structure: filters, default, commands, sections.
+#[derive(Debug, Clone)]
+pub struct GroupedBillboard {
+    /// First unbroken chain of group filters.
+    pub filters: Vec<ClassifiedLine>,
+    /// The last `DEFAULT` statement, if any.
+    pub default_statement: Option<ClassifiedLine>,
+    /// All command lines.
+    pub commands: Vec<ClassifiedLine>,
+    /// Synth sections, in order.
+    pub sections: Vec<SectionGroup>,
+    /// Lines that appeared before any section header (outside filter/default/range).
+    pub orphan_lines: Vec<ClassifiedLine>,
+}
+
+/// Walk classified lines and group them into sections + top-level items.
+///
+/// Rules:
+/// - Group filters are collected only from the first unbroken chain
+///   (comments don't break the chain; any non-filter, non-comment line does).
+/// - The last `DEFAULT` statement is recorded.
+/// - All `COMMAND`/`UPDATE_COMMAND`/`QUEUE_COMMAND` lines are collected.
+/// - Track and Effect lines are grouped under their most recent `SynthHeader`.
+/// - Orphan tracks/effects (before any header) are stored separately.
+pub fn group_sections(classified: &[ClassifiedLine]) -> GroupedBillboard {
+    let mut filters = Vec::new();
+    let mut default_statement = None;
+    let mut commands = Vec::new();
+    let mut sections: Vec<SectionGroup> = Vec::new();
+    let mut orphan_lines = Vec::new();
+
+    let mut in_filter_chain = true;
+    let mut current_section: Option<SectionGroup> = None;
+
+    for line in classified {
+        match line.line_type {
+            LineType::GroupFilter => {
+                if in_filter_chain {
+                    filters.push(line.clone());
+                } else {
+                    // Filter after chain is broken → orphan
+                    orphan_lines.push(line.clone());
+                }
+            }
+
+            LineType::DefaultStatement => {
+                in_filter_chain = false;
+                default_statement = Some(line.clone());
+            }
+
+            LineType::Command => {
+                in_filter_chain = false;
+                commands.push(line.clone());
+            }
+
+            LineType::SynthHeader => {
+                in_filter_chain = false;
+                // Close previous section
+                if let Some(prev) = current_section.take() {
+                    sections.push(prev);
+                }
+                current_section = Some(SectionGroup {
+                    header: line.clone(),
+                    tracks: Vec::new(),
+                    effects: Vec::new(),
+                    comments: Vec::new(),
+                });
+            }
+
+            LineType::TrackDefinition => {
+                in_filter_chain = false;
+                match &mut current_section {
+                    Some(s) => s.tracks.push(line.clone()),
+                    None => orphan_lines.push(line.clone()),
+                }
+            }
+
+            LineType::EffectDefinition => {
+                in_filter_chain = false;
+                match &mut current_section {
+                    Some(s) => s.effects.push(line.clone()),
+                    None => orphan_lines.push(line.clone()),
+                }
+            }
+
+            LineType::Comment => {
+                // Comments don't break the filter chain.
+                // If we're inside a section, store them for index tracking.
+                if let Some(s) = &mut current_section {
+                    s.comments.push(line.clone());
+                }
+                // Otherwise just ignore (don't break filter chain).
+            }
+        }
+    }
+
+    // Push the last section
+    if let Some(last) = current_section {
+        sections.push(last);
+    }
+
+    GroupedBillboard {
+        filters,
+        default_statement,
+        commands,
+        sections,
+        orphan_lines,
+    }
 }
 
 #[cfg(test)]
@@ -422,5 +545,186 @@ DEFAULT amp0.3
         assert_eq!(classified[0].line_type, LineType::Comment);
         assert_eq!(classified[1].line_type, LineType::Comment);
         assert_eq!(classified[2].line_type, LineType::SynthHeader);
+    }
+
+    // -- group_sections --
+
+    fn classify(s: &str) -> Vec<ClassifiedLine> {
+        classify_source(s)
+    }
+
+    #[test]
+    fn test_group_empty() {
+        let g = group_sections(&[]);
+        assert!(g.filters.is_empty());
+        assert!(g.default_statement.is_none());
+        assert!(g.commands.is_empty());
+        assert!(g.sections.is_empty());
+    }
+
+    #[test]
+    fn test_group_single_section_with_tracks() {
+        let source = "\
+@moogBass:bass amp0.5
+c4 d4 e4 f4
+g4 a4 b4 c5
+";
+        let g = group_sections(&classify(source));
+        assert_eq!(g.sections.len(), 1);
+        assert_eq!(g.sections[0].tracks.len(), 2);
+        assert!(g.sections[0].effects.is_empty());
+        assert_eq!(g.sections[0].header.content, "@moogBass:bass amp0.5");
+    }
+
+    #[test]
+    fn test_group_multiple_sections() {
+        let source = "\
+@moogBass:bass
+c4 d4
+@keys:melody
+e4 f4
+";
+        let g = group_sections(&classify(source));
+        assert_eq!(g.sections.len(), 2);
+        assert_eq!(g.sections[0].tracks.len(), 1);
+        assert_eq!(g.sections[1].tracks.len(), 1);
+        assert_eq!(g.sections[0].header.content, "@moogBass:bass");
+        assert_eq!(g.sections[1].header.content, "@keys:melody");
+    }
+
+    #[test]
+    fn test_group_filters_first_chain() {
+        let source = "\
+>>> drums bass
+>>> keys
+# comment
+@synth:drums
+c4
+";
+        let g = group_sections(&classify(source));
+        assert_eq!(g.filters.len(), 2);
+        assert_eq!(g.sections.len(), 1);
+    }
+
+    #[test]
+    fn test_group_filters_breaks_on_non_filter() {
+        let source = "\
+>>> drums
+@synth
+>>> keys   # this filter is past the break
+";
+        let g = group_sections(&classify(source));
+        assert_eq!(g.filters.len(), 1);
+        // Second filter becomes orphan
+        assert_eq!(g.orphan_lines.len(), 1);
+        assert_eq!(g.orphan_lines[0].content, ">>> keys");
+    }
+
+    #[test]
+    fn test_group_default_statement() {
+        let source = "\
+DEFAULT amp0.5
+@synth
+c4
+";
+        let g = group_sections(&classify(source));
+        assert!(g.default_statement.is_some());
+        assert_eq!(g.default_statement.unwrap().content, "DEFAULT amp0.5");
+    }
+
+    #[test]
+    fn test_group_last_default_wins() {
+        let source = "\
+DEFAULT amp0.5
+@synth
+DEFAULT sus1.0
+";
+        let g = group_sections(&classify(source));
+        assert!(g.default_statement.is_some());
+        assert_eq!(g.default_statement.unwrap().content, "DEFAULT sus1.0");
+    }
+
+    #[test]
+    fn test_group_commands() {
+        let source = "\
+COMMAND /set_bpm 120
+@synth
+c4
+COMMAND /transpose 5
+";
+        let g = group_sections(&classify(source));
+        assert_eq!(g.commands.len(), 2);
+    }
+
+    #[test]
+    fn test_group_effects_in_section() {
+        let source = "\
+@synth:keys
+c4 e4
+€reverb:main room0.9
+€delay:echo time0.25
+";
+        let g = group_sections(&classify(source));
+        assert_eq!(g.sections.len(), 1);
+        assert_eq!(g.sections[0].effects.len(), 2);
+        assert_eq!(g.sections[0].effects[0].content, "€reverb:main room0.9");
+        assert_eq!(g.sections[0].effects[1].content, "€delay:echo time0.25");
+    }
+
+    #[test]
+    fn test_group_comments_in_section() {
+        let source = "\
+@synth
+c4 d4
+# comment inside section
+e4 f4
+";
+        let g = group_sections(&classify(source));
+        assert_eq!(g.sections.len(), 1);
+        // The comment is kept in the section
+        assert_eq!(g.sections[0].comments.len(), 1);
+        assert_eq!(g.sections[0].tracks.len(), 2);
+    }
+
+    #[test]
+    fn test_group_orphan_tracks_before_header() {
+        let source = "\
+c4 d4
+@synth
+e4 f4
+";
+        let g = group_sections(&classify(source));
+        assert_eq!(g.orphan_lines.len(), 1);
+        assert_eq!(g.orphan_lines[0].content, "c4 d4");
+        assert_eq!(g.sections[0].tracks.len(), 1);
+    }
+
+    #[test]
+    fn test_group_complex_file() {
+        let source = "\
+# header comment
+>>> drums bass
+
+@SP_Roland808:drums ofs0
+14 14 26 32
+€reverb:main room0.5
+
+@moogBass:bass amp0.5
+c4 d4
+# commented track
+g4 a4
+
+COMMAND /set_bpm 120
+DEFAULT amp0.3
+";
+        let g = group_sections(&classify(source));
+        assert_eq!(g.filters.len(), 1);
+        assert_eq!(g.commands.len(), 1);
+        assert!(g.default_statement.is_some());
+        assert_eq!(g.sections.len(), 2);
+        assert_eq!(g.sections[0].tracks.len(), 1);
+        assert_eq!(g.sections[0].effects.len(), 1);
+        assert_eq!(g.sections[1].tracks.len(), 2);
+        assert_eq!(g.sections[1].comments.len(), 1);
     }
 }
