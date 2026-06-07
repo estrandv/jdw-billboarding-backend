@@ -1,0 +1,14 @@
+[package]
+name = "jdw-billboarding-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Billboard notation parser and OSC converter for JackDAW"
+
+[lib]
+name = "jdw_billboarding_backend"
+path = "src/lib.rs"
+
+[dependencies]
+rosc = "0.10.1"
+jdw-osc-lib = { git = "https://github.com/estrandv/jdw-osc-lib.git", branch = "master" }
+log = "0.4"
