@@ -1039,6 +1039,226 @@ pub fn send_full_commands(
     Ok(())
 }
 
+// ========== NRT bundle builders ==========
+
+/// Build an `nrt_preload` bundle wrapping timed setup messages.
+///
+/// Wire format:
+/// ```osc
+/// /bundle_info "nrt_preload"
+/// [untagged inner bundle containing timed messages]
+/// ```
+pub fn build_nrt_preload_bundle(timed_msgs: &[crate::score::TimedScoreMessage]) -> OscPacket {
+    let inner = osc_bundle_from_timed(timed_msgs);
+    OscPacket::Bundle(rosc::OscBundle {
+        timetag: osc_timetag_now(),
+        content: vec![
+            OscPacket::Message(OscMessage {
+                addr: "/bundle_info".to_string(),
+                args: vec![OscType::String("nrt_preload".to_string())],
+            }),
+            inner,
+        ],
+    })
+}
+
+/// Build an `nrt_record` bundle with metadata + timed track messages.
+///
+/// Wire format:
+/// ```osc
+/// /bundle_info "nrt_record"
+/// /nrt_record_info <bpm: float> <filename: string> <end_beat: float>
+/// [untagged inner bundle containing timed messages]
+/// ```
+pub fn build_nrt_record_bundle(
+    timed_msgs: &[crate::score::TimedScoreMessage],
+    bpm: f64,
+    file_name: &str,
+    end_beat: f64,
+) -> OscPacket {
+    let inner = osc_bundle_from_timed(timed_msgs);
+    OscPacket::Bundle(rosc::OscBundle {
+        timetag: osc_timetag_now(),
+        content: vec![
+            OscPacket::Message(OscMessage {
+                addr: "/bundle_info".to_string(),
+                args: vec![OscType::String("nrt_record".to_string())],
+            }),
+            OscPacket::Message(OscMessage {
+                addr: "/nrt_record_info".to_string(),
+                args: vec![
+                    OscType::Float(bpm as f32),
+                    OscType::String(file_name.to_string()),
+                    OscType::Float(end_beat as f32),
+                ],
+            }),
+            inner,
+        ],
+    })
+}
+
+/// Build a plain (untagged) OSC bundle from timed score messages.
+fn osc_bundle_from_timed(msgs: &[crate::score::TimedScoreMessage]) -> OscPacket {
+    let contents: Vec<OscPacket> = msgs
+        .iter()
+        .map(|m| match &m.element {
+            Some(_el) => {
+                // Build a timed_msg bundle (placeholder for now — Phase 2c will fill in)
+                build_timed_msg_bundle_for_score(m)
+            }
+            None => {
+                // Silence → /empty_msg timed bundle
+                build_silence_bundle(m.time)
+            }
+        })
+        .collect();
+    OscPacket::Bundle(rosc::OscBundle {
+        timetag: osc_timetag_now(),
+        content: contents,
+    })
+}
+
+/// Placeholder: build a timed_msg for a score entry (will be replaced in Phase 2c).
+fn build_timed_msg_bundle_for_score(m: &crate::score::TimedScoreMessage) -> OscPacket {
+    let inner = match &m.element {
+        Some(_) => OscPacket::Message(OscMessage {
+            addr: "/note_on_timed".to_string(),
+            args: vec![], // placeholder — real conversion in Phase 2c
+        }),
+        None => OscPacket::Message(OscMessage {
+            addr: "/empty_message".to_string(),
+            args: vec![],
+        }),
+    };
+    OscPacket::Bundle(rosc::OscBundle {
+        timetag: osc_timetag_now(),
+        content: vec![
+            OscPacket::Message(OscMessage {
+                addr: "/bundle_info".to_string(),
+                args: vec![OscType::String("timed_msg".to_string())],
+            }),
+            OscPacket::Message(OscMessage {
+                addr: "/timed_msg_info".to_string(),
+                args: vec![OscType::String(format!("{}", m.time))],
+            }),
+            inner,
+        ],
+    })
+}
+
+/// Build a timed silence bundle for score padding.
+fn build_silence_bundle(time: f64) -> OscPacket {
+    OscPacket::Bundle(rosc::OscBundle {
+        timetag: osc_timetag_now(),
+        content: vec![
+            OscPacket::Message(OscMessage {
+                addr: "/bundle_info".to_string(),
+                args: vec![OscType::String("timed_msg".to_string())],
+            }),
+            OscPacket::Message(OscMessage {
+                addr: "/timed_msg_info".to_string(),
+                args: vec![OscType::String(format!("{}", time))],
+            }),
+            OscPacket::Message(OscMessage {
+                addr: "/empty_message".to_string(),
+                args: vec![],
+            }),
+        ],
+    })
+}
+
+// ========== NRT: Full bundle construction ==========
+
+/// Result of building NRT bundles for a single track/group.
+#[derive(Debug, Clone)]
+pub struct NrtBundleInfo {
+    pub track_name: String,
+    pub nrt_bundle: OscPacket,
+    pub preload_messages: Vec<OscPacket>,
+    pub preload_bundles: Vec<OscPacket>,
+}
+
+/// Build NRT bundles for a billboard.
+pub fn get_nrt_record_bundles(
+    billboard: &full::Billboard,
+    synthdefs: &[crate::synthdefs::SynthDefMessage],
+    samples: &[crate::sample_loader::SampleLoadMessage],
+) -> Vec<NrtBundleInfo> {
+    let mut results = Vec::new();
+
+    let bpm: f64 = billboard
+        .commands
+        .iter()
+        .find(|c| c.address == "/set_bpm")
+        .and_then(|c| c.args.first())
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(120.0);
+
+    let mut score = crate::score::Score::new();
+    for (si, section) in billboard.sections.iter().enumerate() {
+        for track in &section.tracks {
+            if !track.enabled {
+                continue;
+            }
+            let track_name = track_alias(&section.header.instrument, si, track);
+            let group_name = track_group_name(track, section);
+            let elements = match crate::shuttle::parse(&track.content) {
+                Ok(elems) => elems,
+                Err(_) => continue,
+            };
+            score.add_source(track_name, group_name, elements);
+        }
+    }
+
+    let filters = &billboard.filters;
+    if filters.is_empty() {
+        let all_groups: Vec<String> = billboard
+            .sections
+            .iter()
+            .flat_map(|s| s.tracks.iter().map(move |t| track_group_name(t, s)))
+            .collect();
+        score.extend_groups(&all_groups, true);
+    } else {
+        for filter_set in filters {
+            score.extend_groups(filter_set, true);
+        }
+    }
+
+    let timed_tracks = score.unpack_timed_tracks();
+
+    for (track_name, timed_msgs) in &timed_tracks {
+        let mut preload_msgs = vec![OscPacket::Message(OscMessage {
+            addr: "/clear_nrt".to_string(),
+            args: vec![],
+        })];
+        for def in synthdefs {
+            preload_msgs.push(OscPacket::Message(OscMessage {
+                addr: "/create_synthdef".to_string(),
+                args: vec![OscType::String(def.content.clone())],
+            }));
+        }
+        for sm in samples {
+            preload_msgs.push(OscPacket::Message(OscMessage {
+                addr: "/load_sample".to_string(),
+                args: sm.osc_args.clone(),
+            }));
+        }
+
+        let end_beat: f64 = timed_msgs.iter().map(|m| m.time).sum::<f64>() + 8.0;
+        let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
+        let file_name = format!("/home/{}/jdw_output/track_{}.wav", user, track_name);
+
+        results.push(NrtBundleInfo {
+            track_name: track_name.clone(),
+            nrt_bundle: build_nrt_record_bundle(timed_msgs, bpm, &file_name, end_beat),
+            preload_messages: preload_msgs,
+            preload_bundles: vec![build_nrt_preload_bundle(timed_msgs)],
+        });
+    }
+
+    results
+}
+
 /// Full pipeline: setup + queue update + commands for a full Billboard.
 pub fn send_full_billboard(
     billboard: &full::Billboard,
@@ -1512,6 +1732,99 @@ mod tests {
         let mut sorted = non_override.to_vec();
         sorted.sort();
         assert_eq!(non_override, sorted.as_slice(), "non-override arg keys should be alphabetically sorted: {:?}", keys1);
+    }
+
+    // ========== NRT bundle tests ==========
+
+    #[test]
+    fn test_build_nrt_preload_bundle_structure() {
+        let msg = crate::score::TimedScoreMessage {
+            element: None,
+            time: 1.0,
+        };
+        let bundle = build_nrt_preload_bundle(&[msg]);
+
+        match bundle {
+            OscPacket::Bundle(b) => {
+                assert_eq!(b.content.len(), 2);
+                // First: /bundle_info "nrt_preload"
+                if let OscPacket::Message(ref m) = b.content[0] {
+                    assert_eq!(m.addr, "/bundle_info");
+                    assert_eq!(m.args[0], OscType::String("nrt_preload".to_string()));
+                } else { panic!("Expected /bundle_info message"); }
+                // Second: inner bundle
+                assert!(matches!(b.content[1], OscPacket::Bundle(_)), "expected inner bundle");
+            }
+            _ => panic!("Expected bundle"),
+        }
+    }
+
+    #[test]
+    fn test_build_nrt_record_bundle_structure() {
+        let msg = crate::score::TimedScoreMessage {
+            element: None,
+            time: 1.0,
+        };
+        let bundle = build_nrt_record_bundle(&[msg], 126.0, "/tmp/test.wav", 365.0);
+
+        match bundle {
+            OscPacket::Bundle(b) => {
+                assert_eq!(b.content.len(), 3);
+                // First: /bundle_info "nrt_record"
+                if let OscPacket::Message(ref m) = b.content[0] {
+                    assert_eq!(m.addr, "/bundle_info");
+                    assert_eq!(m.args[0], OscType::String("nrt_record".to_string()));
+                } else { panic!("Expected /bundle_info"); }
+                // Second: /nrt_record_info with correct typed args
+                if let OscPacket::Message(ref m) = b.content[1] {
+                    assert_eq!(m.addr, "/nrt_record_info");
+                    assert_eq!(m.args.len(), 3);
+                    assert_eq!(m.args[0], OscType::Float(126.0));
+                    assert!(matches!(&m.args[1], OscType::String(s) if s == "/tmp/test.wav"));
+                    assert_eq!(m.args[2], OscType::Float(365.0));
+                } else { panic!("Expected /nrt_record_info"); }
+                // Third: inner bundle
+                assert!(matches!(b.content[2], OscPacket::Bundle(_)));
+            }
+            _ => panic!("Expected bundle"),
+        }
+    }
+
+    #[test]
+    fn test_get_nrt_record_bundles_basic() {
+        let source = "\
+@test:synth
+c4 d4
+";
+        let bb = full::parse(source);
+        let synthdefs = vec![];
+        let samples = vec![];
+        let bundles = get_nrt_record_bundles(&bb, &synthdefs, &samples);
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].track_name, "test_0_0");
+        // Preload messages should include /clear_nrt
+        assert!(bundles[0].preload_messages.iter().any(|m| matches!(m, OscPacket::Message(ref msg) if msg.addr == "/clear_nrt")));
+        // NRT bundle should have 3 children
+        if let OscPacket::Bundle(ref b) = bundles[0].nrt_bundle {
+            assert_eq!(b.content.len(), 3);
+        } else { panic!("Expected bundle"); }
+    }
+
+    #[test]
+    fn test_get_nrt_record_bundles_with_bpm() {
+        let source = "\
+/set_bpm 140
+@test:synth
+c4
+";
+        let bb = full::parse(source);
+        let bundles = get_nrt_record_bundles(&bb, &[], &[]);
+        if let OscPacket::Bundle(ref b) = bundles[0].nrt_bundle {
+            if let OscPacket::Message(ref m) = b.content[1] {
+                assert_eq!(m.addr, "/nrt_record_info");
+                assert_eq!(m.args[0], OscType::Float(140.0));
+            } else { panic!("Expected /nrt_record_info"); }
+        }
     }
 
     #[test]

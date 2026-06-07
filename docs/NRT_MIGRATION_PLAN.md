@@ -37,7 +37,7 @@ The billboard pipeline is identical up to the branch point:
 - Preload batching (`/clear_nrt`, filtered synthdefs/samples, timed setup messages)
 - Listener — waits for `/nrt_record_finished` from jdw-sc
 
-## Phase 1 — Score Class (src/score.rs)
+## Phase 1 — Score Class (src/score.rs) ✅ DONE
 
 The `Score` class composes tracks into a chronological timeline based on group
 filters. It pads tracks to equal length so they render simultaneously.

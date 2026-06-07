@@ -7,14 +7,17 @@ pub mod note_utils;
 pub mod osc;
 pub mod synthdefs;
 pub mod sample_loader;
+pub mod score;
+pub mod listener;
 
 pub use full::{
     Billboard, BillboardCommand, CommandContext, EffectDefinition, SynthHeader, SynthSection,
     TrackDefinition,
 };
-pub use osc::{dump_queue_update, dump_setup, dump_commands, OscConfig};
+pub use osc::{dump_queue_update, dump_setup, dump_commands, OscConfig, NrtBundleInfo, get_nrt_record_bundles};
 pub use synthdefs::{load_synthdefs, SynthDefMessage};
 pub use sample_loader::{get_default_samples, SampleLoadMessage, Sample};
+pub use listener::Listener;
 pub use macros::{compile_macros, load_and_expand};
 
 /// Parse a billboard file from a string (raw, no macro expansion).
