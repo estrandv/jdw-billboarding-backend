@@ -912,17 +912,17 @@ pub fn build_billboard(grouped: &GroupedBillboard) -> Billboard {
                 .effects
                 .iter()
                 .filter_map(|e| {
-                    parse_effect(&e.content).ok().map(|ed| {
-                        let args: HashMap<String, f64> = ed
-                            .args
-                            .into_iter()
-                            .filter_map(|(k, v)| v.parse::<f64>().ok().map(|fv| (k, fv)))
-                            .collect();
-                        EffectDefinition {
-                            effect_type: ed.effect_type,
-                            id: ed.id,
-                            args,
+                    let ed = parse_effect(&e.content).ok()?;
+                    let mut args = header.default_args.clone();
+                    for (k, v) in ed.args {
+                        if let Ok(fv) = v.parse::<f64>() {
+                            args.insert(k, fv);
                         }
+                    }
+                    Some(EffectDefinition {
+                        effect_type: ed.effect_type,
+                        id: ed.id,
+                        args,
                     })
                 })
                 .collect();
