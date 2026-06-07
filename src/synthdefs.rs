@@ -178,6 +178,11 @@ fn load_synthdefs_from_templates(
         }
     }
 
+    // Also parse macro definitions from the template file itself
+    // (template files define their own $macroname(arg1,arg2) helpers)
+    let template_macros = crate::macros::find_macro_defs(&content);
+    supplied_defs.extend(template_macros);
+
     // Expand macros in the template content
     let expanded = crate::macros::compile_macros(&content, &supplied_defs)?;
 
