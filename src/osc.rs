@@ -1244,10 +1244,17 @@ pub fn get_nrt_record_bundles(
             }
         }
         for sm in samples {
-            preload_msgs.push(OscPacket::Message(OscMessage {
-                addr: "/load_sample".to_string(),
-                args: sm.osc_args.clone(),
-            }));
+            // Only load samples for sampler tracks, and only from the matching pack.
+            // Python's _filter_used_samples filters by section.header.instrument_name.
+            // Synth tracks don't need samples at all.
+            if meta.instrument_type == InstrumentType::Sampler
+                && sm.sample.sample_pack == meta.instrument_name
+            {
+                preload_msgs.push(OscPacket::Message(OscMessage {
+                    addr: "/load_sample".to_string(),
+                    args: sm.osc_args.clone(),
+                }));
+            }
         }
 
         // Convert timed entries to OSC packets using ElementConverter
