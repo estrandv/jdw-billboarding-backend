@@ -10,5 +10,6 @@ path = "src/lib.rs"
 
 [dependencies]
 rosc = "0.10.1"
+bigdecimal = "0.4.2"
 jdw-osc-lib = { git = "https://github.com/estrandv/jdw-osc-lib.git", branch = "master" }
 log = "0.4"

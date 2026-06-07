@@ -3,10 +3,11 @@
 /// Stages (per PLAN_full_billboard_parser.md):
 ///   Stage 1 — Line classifier + continuation + inline comments
 ///   Stage 2 — Section grouper
-///   Stage 3 — Low-level parsers                                  ← current
-///   Stage 4 — Billboard construction + argument inheritance
+///   Stage 3 — Low-level parsers
+///   Stage 4 — Billboard construction + argument inheritance       ← current
 ///   Stage 5 — OSC conversion
 ///   Stage 6 — jdw-suite integration
+use std::collections::HashMap;
 use std::fmt;
 
 /// Line types after syntactic classification.
@@ -722,6 +723,242 @@ pub fn parse_all_filters(g: &GroupedBillboard) -> Vec<Result<FilterData, String>
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Stage 4 — Billboard Construction + Argument Inheritance
+// ---------------------------------------------------------------------------
+
+/// Final, resolved synth header.
+#[derive(Debug, Clone)]
+pub struct SynthHeader {
+    pub instrument: String,
+    pub is_drone: bool,
+    pub is_sampler: bool,
+    pub is_selected: bool,
+    pub group: Option<String>,
+    pub default_args: HashMap<String, f64>,
+    pub pad_config: Vec<(u32, u32)>,
+}
+
+/// Final, resolved track definition.
+#[derive(Debug, Clone)]
+pub struct TrackDefinition {
+    /// Raw shuttle notation content (after stripping `<meta>` prefix).
+    pub content: String,
+    pub group_override: Option<String>,
+    /// Arg overrides with operator: `(op_char, value)`.
+    pub arg_overrides: HashMap<String, (char, f64)>,
+    pub index: usize,
+    pub enabled: bool,
+}
+
+/// Final, resolved effect definition.
+#[derive(Debug, Clone)]
+pub struct EffectDefinition {
+    pub effect_type: String,
+    pub id: String,
+    pub args: HashMap<String, f64>,
+}
+
+/// Final, resolved synth section.
+#[derive(Debug, Clone)]
+pub struct SynthSection {
+    pub header: SynthHeader,
+    pub tracks: Vec<TrackDefinition>,
+    pub effects: Vec<EffectDefinition>,
+}
+
+/// Final billboard command.
+#[derive(Debug, Clone)]
+pub struct BillboardCommand {
+    pub context: CommandContext,
+    pub address: String,
+    pub args: Vec<String>,
+}
+
+/// The final parsed Billboard.
+#[derive(Debug, Clone)]
+pub struct Billboard {
+    pub sections: Vec<SynthSection>,
+    pub filters: Vec<Vec<String>>,
+    pub commands: Vec<BillboardCommand>,
+    pub default_args: HashMap<String, f64>,
+}
+
+/// Resolve argument inheritance chain.
+///
+/// Priority (lowest → highest):
+/// 1. `defaults` — global `DEFAULT` statement
+/// 2. `header_args` — synth header line args
+/// 3. `track_overrides` — track metadata operators
+///
+/// Operators:
+/// - `_` or `=`: Replace
+/// - `+`: Add to inherited
+/// - `-`: Subtract from inherited
+/// - `*`: Multiply inherited
+pub fn resolve_args(
+    defaults: &HashMap<String, f64>,
+    header_args: &HashMap<String, f64>,
+    track_overrides: &HashMap<String, (char, f64)>,
+) -> HashMap<String, f64> {
+    let mut result = defaults.clone();
+    for (k, v) in header_args {
+        result.insert(k.clone(), *v);
+    }
+    for (k, &(op, v)) in track_overrides {
+        match op {
+            '=' | '_' => {
+                result.insert(k.clone(), v);
+            }
+            '+' => {
+                *result.entry(k.clone()).or_insert(0.0) += v;
+            }
+            '-' => {
+                *result.entry(k.clone()).or_insert(0.0) -= v;
+            }
+            '*' => {
+                *result.entry(k.clone()).or_insert(1.0) *= v;
+            }
+            _ => {
+                result.insert(k.clone(), v);
+            }
+        }
+    }
+    result
+}
+
+/// Build a `Billboard` from a `GroupedBillboard`.
+pub fn build_billboard(grouped: &GroupedBillboard) -> Billboard {
+    // Parse defaults
+    let default_args: HashMap<String, f64> = grouped
+        .default_statement
+        .as_ref()
+        .map(|d| {
+            let rest = d.content[7..].trim();
+            parse_simple_args(rest)
+                .into_iter()
+                .filter_map(|(k, v)| v.parse::<f64>().ok().map(|fv| (k, fv)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Parse filters
+    let filters: Vec<Vec<String>> = grouped
+        .filters
+        .iter()
+        .filter_map(|f| parse_filter(&f.content).ok())
+        .map(|fd| fd.groups)
+        .collect();
+
+    // Parse commands
+    let commands: Vec<BillboardCommand> = grouped
+        .commands
+        .iter()
+        .filter_map(|c| parse_command(&c.content).ok())
+        .map(|cd| BillboardCommand {
+            context: cd.context,
+            address: cd.address,
+            args: cd.args,
+        })
+        .collect();
+
+    // Build sections
+    let sections: Vec<SynthSection> = grouped
+        .sections
+        .iter()
+        .filter_map(|sec| {
+            let header_data = parse_synth_header(&sec.header.content).ok()?;
+            let header = SynthHeader {
+                instrument: header_data.instrument,
+                is_drone: header_data.is_drone,
+                is_sampler: header_data.is_sampler,
+                is_selected: header_data.is_selected,
+                group: header_data.group,
+                default_args: header_data
+                    .args
+                    .into_iter()
+                    .filter_map(|(k, v)| v.parse::<f64>().ok().map(|fv| (k, fv)))
+                    .collect(),
+                pad_config: header_data.pad_config,
+            };
+
+            let tracks: Vec<TrackDefinition> = sec
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let meta = parse_track_metadata(&t.content);
+
+                    let content = if meta.is_some() {
+                        let close = t.content.find('>').unwrap_or(0);
+                        t.content[close + 1..].trim().to_string()
+                    } else {
+                        t.content.clone()
+                    };
+
+                    TrackDefinition {
+                        content,
+                        group_override: meta.as_ref().and_then(|m| m.group_override.clone()),
+                        arg_overrides: meta
+                            .map(|m| {
+                                m.arg_overrides
+                                    .into_iter()
+                                    .filter_map(|(k, op, v)| {
+                                        v.parse::<f64>().ok().map(|fv| {
+                                            (k, (op.chars().next().unwrap_or('='), fv))
+                                        })
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        index: i,
+                        enabled: true,
+                    }
+                })
+                .collect();
+
+            let effects: Vec<EffectDefinition> = sec
+                .effects
+                .iter()
+                .filter_map(|e| {
+                    parse_effect(&e.content).ok().map(|ed| {
+                        let args: HashMap<String, f64> = ed
+                            .args
+                            .into_iter()
+                            .filter_map(|(k, v)| v.parse::<f64>().ok().map(|fv| (k, fv)))
+                            .collect();
+                        EffectDefinition {
+                            effect_type: ed.effect_type,
+                            id: ed.id,
+                            args,
+                        }
+                    })
+                })
+                .collect();
+
+            Some(SynthSection {
+                header,
+                tracks,
+                effects,
+            })
+        })
+        .collect();
+
+    Billboard {
+        sections,
+        filters,
+        commands,
+        default_args,
+    }
+}
+
+/// Full pipeline: classify → group → build Billboard.
+pub fn parse(source: &str) -> Billboard {
+    let classified = classify_source(source);
+    let grouped = group_sections(&classified);
+    build_billboard(&grouped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1359,5 +1596,165 @@ DEFAULT amp0.3
         assert_eq!(g.sections[0].effects.len(), 1);
         assert_eq!(g.sections[1].tracks.len(), 2);
         assert_eq!(g.sections[1].comments.len(), 1);
+    }
+
+    // -- resolve_args --
+
+    #[test]
+    fn test_resolve_args_empty() {
+        let r = resolve_args(&HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_args_defaults_only() {
+        let mut d = HashMap::new();
+        d.insert("amp".to_string(), 0.5);
+        let r = resolve_args(&d, &HashMap::new(), &HashMap::new());
+        assert_eq!(r.get("amp"), Some(&0.5));
+    }
+
+    #[test]
+    fn test_resolve_args_header_overrides_default() {
+        let mut d = HashMap::new();
+        d.insert("amp".to_string(), 0.5);
+        let mut h = HashMap::new();
+        h.insert("amp".to_string(), 1.0);
+        let r = resolve_args(&d, &h, &HashMap::new());
+        assert_eq!(r.get("amp"), Some(&1.0));
+    }
+
+    #[test]
+    fn test_resolve_args_override_add() {
+        let mut d = HashMap::new();
+        d.insert("amp".to_string(), 0.5);
+        let mut t = HashMap::new();
+        t.insert("amp".to_string(), ('+', 0.3));
+        let r = resolve_args(&d, &HashMap::new(), &t);
+        assert!((r.get("amp").unwrap() - 0.8).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_resolve_args_override_mult() {
+        let mut d = HashMap::new();
+        d.insert("amp".to_string(), 0.5);
+        let mut t = HashMap::new();
+        t.insert("amp".to_string(), ('*', 2.0));
+        let r = resolve_args(&d, &HashMap::new(), &t);
+        assert!((r.get("amp").unwrap() - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_resolve_args_override_sub() {
+        let mut h = HashMap::new();
+        h.insert("sus".to_string(), 1.0);
+        let mut t = HashMap::new();
+        t.insert("sus".to_string(), ('-', 0.3));
+        let r = resolve_args(&HashMap::new(), &h, &t);
+        assert!((r.get("sus").unwrap() - 0.7).abs() < 1e-10);
+    }
+
+    // -- build_billboard / parse --
+
+    #[test]
+    fn test_parse_empty() {
+        let b = parse("");
+        assert!(b.sections.is_empty());
+        assert!(b.filters.is_empty());
+        assert!(b.commands.is_empty());
+        assert!(b.default_args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_default_args() {
+        let b = parse("DEFAULT amp0.5,sus1.0");
+        assert_eq!(b.default_args.get("amp"), Some(&0.5));
+        assert_eq!(b.default_args.get("sus"), Some(&1.0));
+    }
+
+    #[test]
+    fn test_parse_synths_and_tracks() {
+        let source = "\
+@moogBass:bass amp0.5
+c4 d4 e4
+g4 a4 b4
+";
+        let b = parse(source);
+        assert_eq!(b.sections.len(), 1);
+        assert_eq!(b.sections[0].header.instrument, "moogBass");
+        assert_eq!(b.sections[0].header.group, Some("bass".to_string()));
+        assert_eq!(b.sections[0].header.default_args.get("amp"), Some(&0.5));
+        assert_eq!(b.sections[0].tracks.len(), 2);
+        assert_eq!(b.sections[0].tracks[0].content, "c4 d4 e4");
+        assert_eq!(b.sections[0].tracks[0].index, 0);
+        assert!(b.sections[0].tracks[0].enabled);
+    }
+
+    #[test]
+    fn test_parse_complex() {
+        let source = "\
+>>> drums bass
+
+COMMAND /set_bpm 120
+DEFAULT amp0.3
+
+@SP_Roland808:drums ofs0 1:0 2:14
+14 14 26 32
+€reverb:main room0.9,mix0.5
+
+@moogBass:bass
+<harmony; amp*1.5> c4 d4
+";
+        let b = parse(source);
+
+        // Filters
+        assert_eq!(b.filters.len(), 1);
+        assert_eq!(b.filters[0], vec!["drums", "bass"]);
+
+        // Commands
+        assert_eq!(b.commands.len(), 1);
+        assert_eq!(b.commands[0].address, "/set_bpm");
+
+        // Default args
+        assert_eq!(b.default_args.get("amp"), Some(&0.3));
+
+        // Section 0: sampler
+        let s0 = &b.sections[0];
+        assert!(s0.header.is_sampler);
+        assert!(!s0.header.is_selected);
+        assert_eq!(s0.header.instrument, "Roland808");
+        assert_eq!(s0.header.pad_config, vec![(1, 0), (2, 14)]);
+        assert_eq!(s0.tracks.len(), 1);
+        assert_eq!(s0.tracks[0].content, "14 14 26 32");
+        assert_eq!(s0.effects.len(), 1);
+        assert_eq!(s0.effects[0].effect_type, "reverb");
+        assert_eq!(s0.effects[0].args.get("room"), Some(&0.9));
+
+        // Section 1: bass
+        let s1 = &b.sections[1];
+        assert_eq!(s1.header.instrument, "moogBass");
+        assert_eq!(s1.tracks.len(), 1);
+        assert_eq!(s1.tracks[0].group_override, Some("harmony".to_string()));
+        assert_eq!(s1.tracks[0].content, "c4 d4");
+        // Resolve args for track: default(amp=0.3) + header(none) + override(amp*1.5)
+        let resolved = resolve_args(
+            &b.default_args,
+            &s1.header.default_args,
+            &s1.tracks[0].arg_overrides,
+        );
+        assert!((resolved.get("amp").unwrap() - 0.45).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_parse_track_metadata_stripped() {
+        let source = "\
+@synth
+<harmony; amp=2.0> c4 d4
+";
+        let b = parse(source);
+        assert_eq!(b.sections[0].tracks[0].content, "c4 d4");
+        assert_eq!(b.sections[0].tracks[0].group_override, Some("harmony".to_string()));
+        let overrides = &b.sections[0].tracks[0].arg_overrides;
+        assert_eq!(overrides.get("amp"), Some(&('=', 2.0)));
     }
 }

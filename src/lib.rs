@@ -3,17 +3,20 @@ pub mod billboard;
 pub mod full;
 pub mod osc;
 
-pub use billboard::{Billboard, Track};
+pub use full::{
+    Billboard, BillboardCommand, CommandContext, EffectDefinition, SynthHeader, SynthSection,
+    TrackDefinition,
+};
 pub use osc::OscConfig;
 
-/// Parse a mini-billboard file from a string.
-pub fn parse_billboard(source: &str) -> Result<Billboard, String> {
-    billboard::parse(source)
+/// Parse a billboard file from a string (full format).
+pub fn parse_billboard(source: &str) -> Billboard {
+    full::parse(source)
 }
 
-/// Read and parse a mini-billboard file from the given path.
+/// Read and parse a billboard file from the given path.
 pub fn parse_billboard_file(path: &str) -> Result<Billboard, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read {}: {}", path, e))?;
-    parse_billboard(&content)
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path, e))?;
+    Ok(full::parse(&content))
 }
