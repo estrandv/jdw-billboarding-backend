@@ -1046,9 +1046,10 @@ pub fn send_full_billboard(
     send_samples(samples, config)?;
     send_full_setup(synthdefs, config)?;
     send_effects_clear(config)?;
-    send_drones_create(billboard, config)?;
-    send_effects_create(billboard, config)?;
+    // Commands (routers) must precede effects/drones — SC bus order is strict
     send_full_commands(billboard, config)?;
+    send_effects_create(billboard, config)?;
+    send_drones_create(billboard, config)?;
     send_full_queue_update(billboard, config)
 }
 
