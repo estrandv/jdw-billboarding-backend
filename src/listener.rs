@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// Default timeout in seconds for NRT response.
-const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 /// An OSC listener that records incoming message addresses.
 pub struct Listener {
