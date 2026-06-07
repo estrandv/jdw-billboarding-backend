@@ -65,8 +65,9 @@ const SC_DELAY_MS: i32 = 70;
 
 /// Check if a resolved element matches a given symbol (e.g., `x` for silence).
 fn is_symbol(element: &ResolvedElement, sym: &str) -> bool {
-    element.suffix.to_lowercase() == sym
-        && element.prefix.is_empty()
+    let prefix_matches = element.prefix == sym;
+    let suffix_matches = element.suffix.to_lowercase() == sym && element.prefix.is_empty();
+    (prefix_matches || suffix_matches)
         && element.index == 0
 }
 
@@ -87,10 +88,12 @@ fn cut_first(s: &str, n: usize) -> String {
 /// Convert resolved element args to a flat OSC arg list, inserting overrides.
 fn args_as_osc(args: &HashMap<String, f64>, overrides: &[OscType]) -> Vec<OscType> {
     let mut osc_args: Vec<OscType> = overrides.to_vec();
-    for (key, val) in args {
+    let mut sorted_keys: Vec<&String> = args.keys().collect();
+    sorted_keys.sort();
+    for key in sorted_keys {
         if !overrides.iter().any(|o| matches!(o, OscType::String(s) if s == key)) {
             osc_args.push(OscType::String(key.clone()));
-            osc_args.push(OscType::Float(*val as f32));
+            osc_args.push(OscType::Float(args[key] as f32));
         }
     }
     osc_args
@@ -582,27 +585,26 @@ fn track_to_timed_packets(
     let mut packets = Vec::new();
 
     for elem in &elements {
-        // Start with the element's inline args (these are the base from the shuttle parser)
-        let mut merged = elem.clone();
-
-        // Apply section args (default + header) — insert only if not already set by element
-        for (k, v) in default_args {
-            merged.args.entry(k.clone()).or_insert(*v);
-        }
+        // Resolve args with Python precedence:
+        //   element_inline > header > default → then track_overrides on top
+        let mut resolved: HashMap<String, f64> = default_args.clone();
         for (k, v) in header_args {
-            merged.args.entry(k.clone()).or_insert(*v);
+            resolved.insert(k.clone(), *v);
         }
-
-        // Apply track-level overrides with operators (highest precedence, Python-style)
+        for (k, v) in &elem.args {
+            resolved.insert(k.clone(), *v);
+        }
         for (k, &(op, v)) in track_overrides {
-            let current = merged.args.entry(k.clone()).or_insert(0.0);
+            let current = resolved.entry(k.clone()).or_insert(0.0);
             match op {
                 '*' => *current *= v,
                 '+' => *current += v,
                 '-' => *current -= v,
-                _ => *current = v, // '=' or '_' → replace
+                _ => *current = v,
             }
         }
+        let mut merged = elem.clone();
+        merged.args = resolved;
 
         match converter.resolve_message(&merged, 0) {
             None => continue,

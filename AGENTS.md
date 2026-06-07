@@ -63,6 +63,15 @@ src/
 
 ### Bug Fixes
 - Shuttle tokenizer: `.` in args like `amp0.5` now correctly tokenizes as `Ident("amp0") Number(".5")` instead of splitting on the dot (was peeking at the same character instead of advancing past it)
+- **Args precedence** (`osc.rs:585`): `track_to_timed_packets` now resolves args in correct Python order — DEFAULT → header → element inline → track overrides. Previously, header args used `or_insert` after defaults, making them unable to override. This fixed `amp` values (e.g. blip amp=1→0.08, aPad amp=1→0.8).
+- **Rest/silence filtering** (`osc.rs:67`): `is_symbol` now checks `prefix` in addition to `suffix`. Shuttle parser puts `x` in prefix (not suffix), so rest elements were falling through to `/play_sample` instead of `/empty_msg`.
+- **Deterministic arg ordering** (`osc.rs:88`): `args_as_osc` now sorts HashMap keys alphabetically for consistent OSC argument order between runs.
+- **OSC output verified** against Python reference for `arena.bbd`: 94/94 messages matched by external ID, 0 Python-only, 1 trivial difference (extra empty_msg).
+
+### OSC Comparison Tools
+- `parse_osc_dump.py` — Python script that parses tcpdump pcap captures into human-readable OSC. Supports `--compact` mode for one-line-per-message output.
+- `normalize_rust_dump.py` — Converts `dump_osc` example output to compact format for diffing.
+- Comparison workflow: `sudo tcpdump -i lo -U -w /tmp/dump.pcap udp port 13339` → `python3 run.py song.bbd` → parse with `parse_osc_dump.py --compact` → diff against `cargo run --example dump_osc`.
 
 ## Remaining Work
 
@@ -73,11 +82,15 @@ Port `nrt_scoring.py` (Score class) and `listener.py` (OSC response listener):
 - `/nrt_record_info` with BPM, filename, end time
 - Wait for `/nrt_record_finished` response
 
+### Minor OSC discrepancies (arena.bbd verified, 94/94 match)
+- 1 extra `/empty_msg` on Rust side (harmless)
+- `jdw all` idempotency: kill existing scsynth/sclang before re-launch
+
 ## Tests
 
 ```
-cargo test                          # 107 library tests
+cargo test                          # 117 library tests
 cargo test --test integration       # 5 integration tests (16 .bbd files)
 ```
 
-All 112 tests passing.
+All 122 tests passing.
