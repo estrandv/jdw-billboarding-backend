@@ -52,37 +52,53 @@ Changes made today:
 - **SCD comments**: strip trailing `//` comments from between synthdefs
 - **jdw-sc fixes**: `/nrt_record_finished` subscription, output dir creation, `/empty_message` no-op, `set_read_timeout` for `await_internal_response`
 
-### Known Issue: `Preloaded nrt packets: 0` → tracks hang
+### 🔴 BLOCKING: `Preloaded nrt packets: 0` → `/nrt_done` never arrives
 
-**Observation**: Tracks where jdw-sc logs `Preloaded nrt packets: 0` sometimes hang.
-The NRT CLI says "Timed out waiting for NRT completion" but jdw-sc eventually sends
-`/nrt_record_finished "FAILURE"`. The track's main bundle DOES have notes (e.g., 168-640 timed messages).
+**This is NOT a timeout problem.** Timeouts are an error scenario. The ONLY acceptable
+outcome is receiving `/nrt_done` from sclang. The `set_read_timeout` fix (57fc9c2)
+in jdw-sc only makes the hang visible by unblocking `recv_from` — it does NOT fix
+why `/nrt_done` never arrives.
 
-**Arguments FOR the theory that empty preloads cause missing `/nrt_done`:**
-1. The pattern is consistent — always the first track with `Preloaded nrt packets: 0` that hangs
-2. Other tracks with non-empty preloads complete quickly
-3. Increasing timeouts (30s→120s→300s) doesn't fix it — it's not a timing issue
-4. jdw-sc's `await_internal_response` had a bug (commented-out `set_read_timeout`) that
-   would cause infinite blocking if no intermediate messages arrive — this was fixed
-   but MAY not have been the root cause
+**Pattern**: Tracks where jdw-sc logs `Preloaded nrt packets: 0` are the ones
+that hang. The main bundle has plenty of notes (168-640 timed messages). The SCD
+file is generated correctly (brackets balanced, verified). jdw-sc sends it to sclang
+via `/read_scd_file`. sclang appears to render it (CPU activity, `nextOSCPacket`
+logs). But `/nrt_done` never comes back.
 
-**Arguments AGAINST:**
-1. Many tracks with `Preloaded nrt packets: 0` DO succeed (e.g., cdrum, 168 notes)
-2. The main bundle carries 168-640 notes regardless of preload emptiness
-3. jdw-sc merges `nrt_preloads` (empty) + bundle messages into the score — both paths
-   lead to the same SCD generation and `await_internal_response` call
-4. The `nrt_record` handler at line 274 runs the same code regardless of preload count
+**What we know for certain:**
+1. SCD files for hanging tracks are syntactically valid (verified bracket balance)
+2. `send_to_sclang` is called for every track (line 371)
+3. `await_internal_response("/nrt_done")` is called for every track (line 382)
+4. The timeout was previously broken (commented-out `set_read_timeout`), meaning
+   the hang was truly infinite, not just slow
+5. Sample filtering reduced SCD size 10x — didn't fix it
+6. Increasing timeouts 30s→120s→300s didn't fix it — not a slowness issue
 
-**What needs investigation tomorrow:**
-1. Trace jdw-sc's `nrt_record` handler line-by-line when `nrt_preloads` is empty:
-   - Does it still call `create_nrt_script`? (line 345) YES
-   - Does it still call `send_to_sclang`? (line 371) YES  
-   - Does it still call `await_internal_response`? (line 382) YES
-   - Does the generated SCD file have valid bracket balance? YES (verified)
-2. Check if the `set_read_timeout` fix (57fc9c2) actually resolves the hang
-3. Compare Python's NRT behavior: does Python also have "empty preload" tracks?
-4. Check if `/nrt_done` is being sent by sclang but not received by jdw-sc
-5. Check if the `server_osc_socket_name` config ("o") is correct for NRT mode
+**Theories (ordered by likelihood):**
+1. **sclang `action:` callback not firing**: The SCD template uses
+   `action: { o.sendMsg("/nrt_done", "ok"); }`. For NRT servers, `o` (the
+   client NetAddr) might not be set correctly, or the NRT render mode doesn't
+   invoke the action callback.
+2. **The `o` socket name**: The config value `server_osc_socket_name = "o"`.
+   In sclang, `o` is a global variable pointing to the default client. After
+   `Server(\nrt, ...)`, does the NRT server still have `o` pointing to jdw-sc?
+3. **Empty preloads cause a different code path in jdw-sc**: Despite tracing
+   showing the same lines execute, maybe `self.nrt_preloads.is_empty()` triggers
+   different behavior elsewhere (e.g., `nrt_sample_pack_dict` state).
+4. **sclang parse failure silently ignored**: The SCD might parse but have a
+   runtime error that prevents the action from firing, with no visible error.
+
+**Investigation plan (tomorrow):**
+1. **Compare Python SCD vs Rust SCD for the same track** — find what's different
+   in the generated SuperCollider script that would cause the action to not fire.
+   Python works, Rust doesn't. Diff them.
+2. **Check if Python also has empty-preload tracks** — if Python's tracks also
+   have 0 preloads but work fine, the issue is definitely in the SCD generation.
+3. **Test with a minimal track** — create a 1-note .bbd file with no commands/effects.
+   Does NRT work for it? If yes, the issue is specific to certain arena.bbd tracks.
+4. **Add /nrt_done logging on the sclang side** — verify whether sclang even
+   attempts to send it. The `nextOSCPacket` logs suggest sclang IS running the
+   score, but maybe the action never fires.
 
 ### NRT Remaining Work
 - **Phase 5**: OSC comparison dump — verify Rust NRT output matches Python's
