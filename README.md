@@ -2,16 +2,15 @@
 
 Rust-native billboard notation parser and OSC converter for JackDAW.
 
-This is the Rust port of the Python `jdw-billboarding-lib`, starting with a
-mini-billboard subset for MVP and converging toward full billboard support.
+Based on a combination of `jdw-billboarding-lib` (base billboarding language parsing MVP) and `jdw-pycompose` (Extemsions like command targets and macro support). 
 
-## Status: MVP
+Key usage is as an imported library in `jdw-suite`, which manages the ecosystem in which this parsing can be used for music making. 
 
-Currently implements a minimal subset of the billboard format:
-- Simple `<trackname>:<synthname> <shuttle>` notation
-- Comment support (`#` prefix disables track)
-- Synth-level args (`key=val`)
-- Shuttle Notation: atomic notes, sections, alternations, repeats, args
+## Status: Faulty
+
+`jdw-pycompose` setup/update/send commands produce different output than what we currently have here for an example song file. 
+
+See: OSC_COMPARISON_PLAN.md. 
 
 ## Usage
 

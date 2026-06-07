@@ -214,7 +214,7 @@ pub struct SectionGroup {
 /// Top-level parsed structure: filters, default, commands, sections.
 #[derive(Debug, Clone)]
 pub struct GroupedBillboard {
-    /// First unbroken chain of group filters.
+    /// All group filter lines (matching Python's extract_group_filters behavior).
     pub filters: Vec<ClassifiedLine>,
     /// The last `DEFAULT` statement, if any.
     pub default_statement: Option<ClassifiedLine>,
@@ -229,8 +229,7 @@ pub struct GroupedBillboard {
 /// Walk classified lines and group them into sections + top-level items.
 ///
 /// Rules:
-/// - Group filters are collected only from the first unbroken chain
-///   (comments don't break the chain; any non-filter, non-comment line does).
+/// - All group filters are collected (matching Python's `extract_group_filters`).
 /// - The last `DEFAULT` statement is recorded.
 /// - All `COMMAND`/`UPDATE_COMMAND`/`QUEUE_COMMAND` lines are collected.
 /// - Track and Effect lines are grouped under their most recent `SynthHeader`.
@@ -242,32 +241,23 @@ pub fn group_sections(classified: &[ClassifiedLine]) -> GroupedBillboard {
     let mut sections: Vec<SectionGroup> = Vec::new();
     let mut orphan_lines = Vec::new();
 
-    let mut in_filter_chain = true;
     let mut current_section: Option<SectionGroup> = None;
 
     for line in classified {
         match line.line_type {
             LineType::GroupFilter => {
-                if in_filter_chain {
-                    filters.push(line.clone());
-                } else {
-                    // Filter after chain is broken → orphan
-                    orphan_lines.push(line.clone());
-                }
+                filters.push(line.clone());
             }
 
             LineType::DefaultStatement => {
-                in_filter_chain = false;
                 default_statement = Some(line.clone());
             }
 
             LineType::Command => {
-                in_filter_chain = false;
                 commands.push(line.clone());
             }
 
             LineType::SynthHeader => {
-                in_filter_chain = false;
                 // Close previous section
                 if let Some(prev) = current_section.take() {
                     sections.push(prev);
@@ -281,7 +271,6 @@ pub fn group_sections(classified: &[ClassifiedLine]) -> GroupedBillboard {
             }
 
             LineType::TrackDefinition => {
-                in_filter_chain = false;
                 match &mut current_section {
                     Some(s) => s.tracks.push(line.clone()),
                     None => orphan_lines.push(line.clone()),
@@ -289,7 +278,6 @@ pub fn group_sections(classified: &[ClassifiedLine]) -> GroupedBillboard {
             }
 
             LineType::EffectDefinition => {
-                in_filter_chain = false;
                 match &mut current_section {
                     Some(s) => s.effects.push(line.clone()),
                     None => orphan_lines.push(line.clone()),
@@ -297,7 +285,6 @@ pub fn group_sections(classified: &[ClassifiedLine]) -> GroupedBillboard {
             }
 
             LineType::Comment => {
-                // Comments don't break the filter chain.
                 // If we're inside a section, store them for index tracking.
                 if let Some(s) = &mut current_section {
                     s.comments.push(line.clone());
@@ -1265,10 +1252,11 @@ c4
 >>> keys   # this filter is past the break
 ";
         let g = group_sections(&classify(source));
-        assert_eq!(g.filters.len(), 1);
-        // Second filter becomes orphan
-        assert_eq!(g.orphan_lines.len(), 1);
-        assert_eq!(g.orphan_lines[0].content, ">>> keys");
+        // All group filters are collected (matching Python's extract_group_filters)
+        assert_eq!(g.filters.len(), 2);
+        assert_eq!(g.filters[0].content, ">>> drums");
+        assert_eq!(g.filters[1].content, ">>> keys");
+        assert!(g.orphan_lines.is_empty());
     }
 
     #[test]

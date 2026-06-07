@@ -18,6 +18,8 @@ pub struct JdwConfig {
     pub delay_quiet: f64,
     pub delay_nrt_preload: f64,
     pub bbd_root: Option<String>,
+    pub synthdefs_scd_path: Option<String>,
+    pub template_synths_path: Option<String>,
 }
 
 impl Default for JdwConfig {
@@ -31,6 +33,8 @@ impl Default for JdwConfig {
             delay_quiet: 0.005,
             delay_nrt_preload: 0.005,
             bbd_root: None,
+            synthdefs_scd_path: None,
+            template_synths_path: None,
         }
     }
 }
@@ -65,6 +69,12 @@ impl JdwConfig {
             }
             if let Some(v) = py.get("bbd_root").and_then(|v| v.as_str()) {
                 self.bbd_root = Some(v.to_string());
+            }
+            if let Some(v) = py.get("synthdefs_scd_path").and_then(|v| v.as_str()) {
+                self.synthdefs_scd_path = Some(v.to_string());
+            }
+            if let Some(v) = py.get("template_synths_path").and_then(|v| v.as_str()) {
+                self.template_synths_path = Some(v.to_string());
             }
             if let Some(delays) = py.get("delays").and_then(|v| v.as_table()) {
                 if let Some(v) = delays.get("inter_message").and_then(|v| v.as_float()) {

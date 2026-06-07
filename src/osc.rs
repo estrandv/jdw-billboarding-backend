@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::str::FromStr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use bigdecimal::BigDecimal;
 use rosc::encoder;
@@ -9,7 +9,7 @@ use rosc::{OscMessage, OscPacket, OscTime, OscType};
 
 use jdw_osc_lib::model::TimedOSCPacket;
 
-use crate::full::{self, resolve_args};
+use crate::full;
 use crate::shuttle::ResolvedElement;
 use crate::note_utils;
 
@@ -318,6 +318,7 @@ fn osc_timetag_now() -> OscTime {
 }
 
 const ROUTER_DEFAULT: &str = "127.0.0.1:13339";
+const DELAY_CONFIGURE_MS: u64 = 5;
 
 /// Configuration for sending OSC messages.
 pub struct OscConfig {
@@ -402,6 +403,20 @@ fn send_to_router(sock: &UdpSocket, addr: &str, packet: &OscPacket) -> Result<()
     Ok(())
 }
 
+/// Convert a string arg to the most specific OscType.
+///
+/// Tries int first, then float, falls back to string. This matches
+/// Python's `pythonosc` auto-detection in `OscMessageBuilder.add_arg()`.
+fn osc_arg_from_str(s: &str) -> OscType {
+    if let Ok(i) = s.parse::<i32>() {
+        return OscType::Int(i);
+    }
+    if let Ok(f) = s.parse::<f32>() {
+        return OscType::Float(f);
+    }
+    OscType::String(s.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Full Billboard OSC conversion (Stage 5+)
 // ---------------------------------------------------------------------------
@@ -421,24 +436,26 @@ fn extract_scale_data(commands: &[full::BillboardCommand]) -> ScaleData {
     ScaleData::default()
 }
 
-/// Collect all unique synths from a full Billboard and send `/read_scd` setup.
-pub fn send_full_setup(billboard: &full::Billboard, config: &OscConfig) -> Result<(), String> {
+/// Send `/create_synthdef` messages for each known SynthDef to the router.
+///
+/// This replaces the old `/read_scd ~jdw.synth()` approach with the
+/// correct OSC protocol (matching the Python `setup()` flow).
+pub fn send_full_setup(
+    synthdefs: &[crate::synthdefs::SynthDefMessage],
+    config: &OscConfig,
+) -> Result<(), String> {
     let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
 
-    let mut synths_seen = std::collections::HashSet::new();
-    for section in &billboard.sections {
-        let synth = &section.header.instrument;
-        if synths_seen.insert(synth.clone()) {
-            let msg = OscPacket::Message(OscMessage {
-                addr: "/read_scd".to_string(),
-                args: vec![OscType::String(format!(
-                    "~jdw.synth(\"{}\").add;",
-                    synth
-                ))],
-            });
-            send_to_router(&sock, &config.router_addr, &msg)?;
-        }
+    for def in synthdefs {
+        let msg = OscPacket::Message(OscMessage {
+            addr: "/create_synthdef".to_string(),
+            args: vec![OscType::String(def.content.clone())],
+        });
+        send_to_router(&sock, &config.router_addr, &msg)?;
+        // Delay between messages to prevent dropped packets (matches Python)
+        std::thread::sleep(Duration::from_millis(DELAY_CONFIGURE_MS));
     }
+
     Ok(())
 }
 
@@ -549,24 +566,48 @@ fn track_alias(synth: &str, section_index: usize, track: &full::TrackDefinition)
 /// `ElementConverter` for proper OSC routing, external IDs, and freq resolution.
 ///
 /// Each packet's `time` is the note duration (beat offset until the next event).
+///
+/// Arg precedence (highest to lowest, matching Python):
+/// 1. Track overrides (with operators: +, -, *, =)
+/// 2. Element inline args (e.g. `c4:amp0.5`)
+/// 3. Section args (default + header merged)
 fn track_to_timed_packets(
     converter: &mut ElementConverter,
     content: &str,
-    resolved_args: &HashMap<String, f64>,
+    default_args: &HashMap<String, f64>,
+    header_args: &HashMap<String, f64>,
+    track_overrides: &HashMap<String, (char, f64)>,
 ) -> Result<Vec<TimedOSCPacket>, String> {
     let elements = crate::shuttle::parse(content)?;
     let mut packets = Vec::new();
 
     for elem in &elements {
-        let mut full_args = resolved_args.clone();
-        for (k, v) in &elem.args {
-            full_args.insert(k.clone(), *v);
+        // Start with the element's inline args (these are the base from the shuttle parser)
+        let mut merged = elem.clone();
+
+        // Apply section args (default + header) — insert only if not already set by element
+        for (k, v) in default_args {
+            merged.args.entry(k.clone()).or_insert(*v);
+        }
+        for (k, v) in header_args {
+            merged.args.entry(k.clone()).or_insert(*v);
         }
 
-        match converter.resolve_message(elem, 0) {
+        // Apply track-level overrides with operators (highest precedence, Python-style)
+        for (k, &(op, v)) in track_overrides {
+            let current = merged.args.entry(k.clone()).or_insert(0.0);
+            match op {
+                '*' => *current *= v,
+                '+' => *current += v,
+                '-' => *current -= v,
+                _ => *current = v, // '=' or '_' → replace
+            }
+        }
+
+        match converter.resolve_message(&merged, 0) {
             None => continue,
             Some(msg) => {
-                let note_len = full_args.get("time").copied().unwrap_or(1.0);
+                let note_len = merged.args.get("time").copied().unwrap_or(1.0);
                 let time = f64_to_bigdecimal(note_len);
                 packets.push(TimedOSCPacket {
                     time,
@@ -579,15 +620,41 @@ fn track_to_timed_packets(
     Ok(packets)
 }
 
+/// Maximum UDP datagram payload size (safe limit for Ethernet + OSC overhead).
+const MAX_UDP_PACKET: usize = 64000;
+
+/// Determine the group name for a track, matching Python's logic:
+/// `track.group_override if set else section.header.group`.
+fn track_group_name(track: &full::TrackDefinition, section: &full::SynthSection) -> String {
+    track
+        .group_override
+        .clone()
+        .unwrap_or_else(|| section.header.group.clone().unwrap_or_default())
+}
+
 /// Send a full Billboard's tracks as sequencer queue updates, using the
 /// correct jdw-suite bundle protocol and ElementConverter.
+///
+/// Respects group filters (`>>>` lines): only tracks whose group is in the
+/// last filter are included. If no filters are defined, all tracks are sent.
+/// Large bundles are automatically split into multiple UDP packets.
 pub fn send_full_queue_update(
     billboard: &full::Billboard,
     config: &OscConfig,
 ) -> Result<(), String> {
     let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
     let scale_data = extract_scale_data(&billboard.commands);
-    let mut update_bundles = Vec::new();
+
+    // Resolve final group filter (last >>> line); empty = no filter
+    let final_filter: Vec<String> = billboard
+        .filters
+        .last()
+        .cloned()
+        .unwrap_or_default();
+    let has_filter = !final_filter.is_empty();
+
+    // Collect individual track bundles
+    let mut update_bundles: Vec<OscPacket> = Vec::new();
 
     for (si, section) in billboard.sections.iter().enumerate() {
         let header_args = &section.header.default_args;
@@ -595,6 +662,14 @@ pub fn send_full_queue_update(
         for track in &section.tracks {
             if !track.enabled {
                 continue;
+            }
+
+            // Apply group filter: skip if track's group is not in final filter
+            if has_filter {
+                let gname = track_group_name(track, section);
+                if !final_filter.contains(&gname) {
+                    continue;
+                }
             }
 
             let instrument_type = if section.header.is_drone {
@@ -620,25 +695,123 @@ pub fn send_full_queue_update(
                 );
             }
 
-            let resolved = resolve_args(&billboard.default_args, header_args, &track.arg_overrides);
-            let timed_packets = track_to_timed_packets(&mut converter, &track.content, &resolved)?;
+            let timed_packets = track_to_timed_packets(
+                &mut converter,
+                &track.content,
+                &billboard.default_args,
+                header_args,
+                &track.arg_overrides,
+            )?;
 
             if timed_packets.is_empty() {
                 continue;
             }
 
             let alias = track_alias(&section.header.instrument, si, track);
-            let bundle = build_update_queue_bundle(&alias, false, &timed_packets);
-            update_bundles.push(bundle);
+            update_bundles.push(build_update_queue_bundle(&alias, false, &timed_packets));
         }
     }
 
-    if !update_bundles.is_empty() {
-        let batch = build_batch_update_bundle(update_bundles, true);
-        send_to_router(&sock, &config.router_addr, &batch)?;
+    if update_bundles.is_empty() {
+        return Ok(());
+    }
+
+    // Split into batches that fit within UDP size limits
+    let mut start = 0;
+    while start < update_bundles.len() {
+        let mut end = update_bundles.len();
+        loop {
+            let is_last = end == update_bundles.len();
+            let batch = build_batch_update_bundle(
+                update_bundles[start..end].to_vec(),
+                is_last,
+            );
+            let encoded = encoder::encode(&batch).map_err(|e| format!("encode: {}", e))?;
+            if encoded.len() < MAX_UDP_PACKET || end == start + 1 {
+                send_to_router(&sock, &config.router_addr, &batch)?;
+                start = end;
+                break;
+            }
+            end -= 1;
+        }
     }
 
     Ok(())
+}
+
+/// Generate a human-readable dump of all OSC packets that `send_full_queue_update`
+/// would send, without actually sending anything. Useful for comparing Rust vs Python output.
+pub fn dump_queue_update(
+    billboard: &full::Billboard,
+) -> Vec<String> {
+    let scale_data = extract_scale_data(&billboard.commands);
+    let final_filter: Vec<String> = billboard
+        .filters
+        .last()
+        .cloned()
+        .unwrap_or_default();
+    let has_filter = !final_filter.is_empty();
+    let mut lines = Vec::new();
+
+    for (si, section) in billboard.sections.iter().enumerate() {
+        let header_args = &section.header.default_args;
+
+        for track in &section.tracks {
+            if !track.enabled { continue; }
+            if has_filter {
+                let gname = track_group_name(track, section);
+                if !final_filter.contains(&gname) { continue; }
+            }
+
+            let instrument_type = if section.header.is_drone { InstrumentType::Drone }
+                else if section.header.is_sampler { InstrumentType::Sampler }
+                else { InstrumentType::Synth };
+
+            let mut converter = ElementConverter::new(
+                &section.header.instrument, &track.index.to_string(),
+                instrument_type, scale_data.clone(),
+            );
+
+            if section.header.is_drone {
+                converter.external_id_override = format!("effect_{}_{}",
+                    section.header.group.as_deref().unwrap_or(""), track.index);
+            }
+
+            let alias = track_alias(&section.header.instrument, si, track);
+            lines.push(format!("--- Track: {} (‘{}’ section {}) ---", alias, section.header.instrument, si));
+
+            match track_to_timed_packets(&mut converter, &track.content,
+                &billboard.default_args, header_args, &track.arg_overrides)
+            {
+                Err(e) => lines.push(format!("  ERROR: {}", e)),
+                Ok(packets) => {
+                    for (i, tp) in packets.iter().enumerate() {
+                        match &tp.packet {
+                            OscPacket::Message(msg) => {
+                                let args: Vec<String> = msg.args.iter().map(|a| osc_type_to_string(a)).collect();
+                                lines.push(format!("  [{}] {} (t={}) {}",
+                                    i, msg.addr, tp.time, args.join(" ")));
+                            }
+                            OscPacket::Bundle(_) => {
+                                lines.push(format!("  [{}] <bundle> (t={})", i, tp.time));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    lines
+}
+
+fn osc_type_to_string(t: &OscType) -> String {
+    match t {
+        OscType::String(s) => format!("\"{}\"", s),
+        OscType::Int(i) => format!("{}", i),
+        OscType::Float(f) => format!("{}", f),
+        _ => format!("{:?}", t),
+    }
 }
 
 /// Send all commands from a full Billboard to the OSC router.
@@ -649,12 +822,13 @@ pub fn send_full_commands(
     let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
 
     for cmd in &billboard.commands {
-        let args: Vec<OscType> = cmd.args.iter().map(|a| OscType::String(a.clone())).collect();
+        let args: Vec<OscType> = cmd.args.iter().map(|a| osc_arg_from_str(a)).collect();
         let msg = OscPacket::Message(OscMessage {
             addr: cmd.address.clone(),
             args,
         });
         send_to_router(&sock, &config.router_addr, &msg)?;
+        std::thread::sleep(Duration::from_millis(DELAY_CONFIGURE_MS));
     }
 
     Ok(())
@@ -663,9 +837,10 @@ pub fn send_full_commands(
 /// Full pipeline: setup + queue update + commands for a full Billboard.
 pub fn send_full_billboard(
     billboard: &full::Billboard,
+    synthdefs: &[crate::synthdefs::SynthDefMessage],
     config: &OscConfig,
 ) -> Result<(), String> {
-    send_full_setup(billboard, config)?;
+    send_full_setup(synthdefs, config)?;
     send_full_queue_update(billboard, config)?;
     send_full_commands(billboard, config)
 }
@@ -679,8 +854,9 @@ mod tests {
     #[test]
     fn test_track_to_timed_packets_basic() {
         let mut converter = ElementConverter::new("testSynth", "0", InstrumentType::Synth, ScaleData::default());
-        let resolved = HashMap::new();
-        let packets = track_to_timed_packets(&mut converter, "c4 d4 e4", &resolved).unwrap();
+        let empty: HashMap<String, f64> = HashMap::new();
+        let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
+        let packets = track_to_timed_packets(&mut converter, "c4 d4 e4", &empty, &empty, &empty_overrides).unwrap();
         assert_eq!(packets.len(), 3);
 
         assert_eq!(packets[0].time, f64_to_bigdecimal(1.0));
@@ -698,7 +874,9 @@ mod tests {
     #[test]
     fn test_track_to_timed_packets_with_args() {
         let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
-        let packets = track_to_timed_packets(&mut converter, "c4:time0.5 d4:time1.5 e4", &HashMap::new()).unwrap();
+        let empty: HashMap<String, f64> = HashMap::new();
+        let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
+        let packets = track_to_timed_packets(&mut converter, "c4:time0.5 d4:time1.5 e4", &empty, &empty, &empty_overrides).unwrap();
 
         assert_eq!(packets.len(), 3);
         assert_eq!(packets[0].time, f64_to_bigdecimal(0.5));
@@ -709,7 +887,9 @@ mod tests {
     #[test]
     fn test_track_to_timed_packets_sampler() {
         let mut converter = ElementConverter::new("Roland808", "0", InstrumentType::Sampler, ScaleData::default());
-        let packets = track_to_timed_packets(&mut converter, "14 26 32", &HashMap::new()).unwrap();
+        let empty: HashMap<String, f64> = HashMap::new();
+        let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
+        let packets = track_to_timed_packets(&mut converter, "14 26 32", &empty, &empty, &empty_overrides).unwrap();
         assert_eq!(packets.len(), 3);
         if let OscPacket::Message(ref msg) = packets[0].packet {
             assert_eq!(msg.addr, "/play_sample");
@@ -889,8 +1069,8 @@ mod tests {
 
         assert!(!bb.commands.is_empty());
         assert!(!bb.sections.is_empty());
-        // Filters appear after commands break the chain, so they're orphans
-        assert!(bb.filters.is_empty());
+        // Filters are collected regardless of position (matching Python)
+        // rattlesnake.bbd has >>> lines after commands
         assert!(!bb.sections[0].tracks.is_empty());
         // Check that tracks with metadata strip content correctly
         let has_meta = bb.sections.iter().any(|s| {
@@ -901,3 +1081,5 @@ mod tests {
         assert!(has_meta);
     }
 }
+
+
