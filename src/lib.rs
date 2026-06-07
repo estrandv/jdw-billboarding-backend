@@ -14,7 +14,7 @@ pub use full::{
     Billboard, BillboardCommand, CommandContext, EffectDefinition, SynthHeader, SynthSection,
     TrackDefinition,
 };
-pub use osc::{dump_queue_update, dump_setup, dump_commands, OscConfig, NrtBundleInfo, get_nrt_record_bundles};
+pub use osc::{dump_queue_update, dump_setup, dump_commands, dump_nrt, OscConfig, NrtBundleInfo, get_nrt_record_bundles};
 pub use synthdefs::{load_synthdefs, SynthDefMessage};
 pub use sample_loader::{get_default_samples, SampleLoadMessage, Sample};
 pub use listener::Listener;

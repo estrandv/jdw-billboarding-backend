@@ -1,13 +1,13 @@
 use std::env;
 use jdw_billboarding_backend::{
-    parse_billboard_file, dump_queue_update, dump_setup, dump_commands, load_synthdefs,
+    parse_billboard_file, dump_queue_update, dump_setup, dump_commands, dump_nrt, load_synthdefs,
 };
 use jdw_billboarding_backend::config::JdwConfig;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} [--phase setup|commands|play|all] <file.bbd>", args[0]);
+        eprintln!("Usage: {} [--phase setup|commands|play|nrt|all] <file.bbd>", args[0]);
         std::process::exit(1);
     }
 
@@ -49,6 +49,21 @@ fn main() {
         let bb = parse_billboard_file(path)
             .unwrap_or_else(|e| { eprintln!("Parse error: {}", e); std::process::exit(1); });
         for line in dump_commands(&bb) {
+            println!("{}", line);
+        }
+    }
+
+    if phase == "nrt" || phase == "all" {
+        let bb = parse_billboard_file(path)
+            .unwrap_or_else(|e| { eprintln!("Parse error: {}", e); std::process::exit(1); });
+        let defs = load_synthdefs(
+            cfg.synthdefs_scd_path.as_deref(),
+            cfg.template_synths_path.as_deref(),
+            cfg.bbd_root.as_deref(),
+        );
+        let sample_pack_dir = cfg.sample_pack_dir.as_deref().unwrap_or("~/sample_packs");
+        let samples = jdw_billboarding_backend::get_default_samples(sample_pack_dir);
+        for line in dump_nrt(&bb, &defs, &samples) {
             println!("{}", line);
         }
     }

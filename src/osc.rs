@@ -936,6 +936,72 @@ pub fn dump_commands(billboard: &full::Billboard) -> Vec<String> {
     lines
 }
 
+/// Dump all NRT bundles as human-readable text for comparison.
+pub fn dump_nrt(
+    billboard: &full::Billboard,
+    synthdefs: &[crate::synthdefs::SynthDefMessage],
+    samples: &[crate::sample_loader::SampleLoadMessage],
+) -> Vec<String> {
+    let bundles = get_nrt_record_bundles(billboard, synthdefs, samples);
+    let mut lines = Vec::new();
+    lines.push(format!("--- NRT ({} tracks) ---", bundles.len()));
+
+    for info in &bundles {
+        lines.push(format!("Track: {}", info.track_name));
+
+        lines.push(format!("  Preload messages ({}):", info.preload_messages.len()));
+        for (i, msg) in info.preload_messages.iter().enumerate() {
+            if let OscPacket::Message(ref m) = msg {
+                lines.push(format!("    [{}] {} {}", i, m.addr,
+                    if m.addr == "/create_synthdef" {
+                        let content = m.args.get(0).and_then(|a| match a {
+                            OscType::String(s) => Some(s.as_str()),
+                            _ => None,
+                        }).unwrap_or("?");
+                        truncate_for_dump(content, 40)
+                    } else if m.addr == "/load_sample" {
+                        format!("{} args", m.args.len())
+                    } else {
+                        "".to_string()
+                    }
+                ));
+            }
+        }
+
+        lines.push(format!("  Preload bundles: {}", info.preload_bundles.len()));
+
+        // Show nrt_record bundle structure
+        if let OscPacket::Bundle(ref b) = info.nrt_bundle {
+            lines.push(format!("  nrt_record bundle ({} children):", b.content.len()));
+            for (i, child) in b.content.iter().enumerate() {
+                match child {
+                    OscPacket::Message(ref m) => {
+                        let args: Vec<String> = m.args.iter().map(|a| osc_type_to_string(a)).collect();
+                        lines.push(format!("    [{}] {} {}", i, m.addr, args.join(" ")));
+                    }
+                    OscPacket::Bundle(ref inner) => {
+                        let msg_count = inner.content.len();
+                        lines.push(format!("    [{}] <bundle> ({} timed msgs)", i, msg_count));
+                        // Show first few messages
+                        for (j, c) in inner.content.iter().take(3).enumerate() {
+                            if let OscPacket::Bundle(ref timed) = c {
+                                if let Some(OscPacket::Message(ref m)) = timed.content.last() {
+                                    lines.push(format!("      [{}] {}", j, m.addr));
+                                }
+                            }
+                        }
+                        if msg_count > 3 {
+                            lines.push(format!("      ... and {} more", msg_count - 3));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    lines
+}
+
 /// Truncate a long string for dump display.
 fn truncate_for_dump(s: &str, max: usize) -> String {
     let clean = s.replace('\n', "\\n");
