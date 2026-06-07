@@ -142,6 +142,155 @@ fn get_sample_category(file_name: &str) -> String {
     String::new()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_category_bass_drum() {
+        assert_eq!(get_sample_category("BD7500.WAV"), "bd");
+        assert_eq!(get_sample_category("bd_01.wav"), "bd");
+        assert_eq!(get_sample_category("Kick_bd.wav"), "bd");
+    }
+
+    #[test]
+    fn test_category_snare() {
+        assert_eq!(get_sample_category("SD0000.WAV"), "sn");
+        assert_eq!(get_sample_category("snare_01.wav"), "sn");
+    }
+
+    #[test]
+    fn test_category_hihat() {
+        assert_eq!(get_sample_category("HH_01.wav"), "hh");
+        assert_eq!(get_sample_category("hat_closed.wav"), "hh");
+        assert_eq!(get_sample_category("ride_bell.wav"), "hh");
+    }
+
+    #[test]
+    fn test_category_cymbal() {
+        assert_eq!(get_sample_category("CY0000.WAV"), "cy");
+        assert_eq!(get_sample_category("crash_01.wav"), "cy");
+    }
+
+    #[test]
+    fn test_category_tom() {
+        assert_eq!(get_sample_category("LT_01.wav"), "to");
+        assert_eq!(get_sample_category("tom_high.wav"), "to");
+        assert_eq!(get_sample_category("HT0000.WAV"), "to");
+    }
+
+    #[test]
+    fn test_category_bell() {
+        assert_eq!(get_sample_category("CB-01.wav"), "be");
+        assert_eq!(get_sample_category("cowbell.wav"), "be");
+    }
+
+    #[test]
+    fn test_category_unknown() {
+        assert_eq!(get_sample_category("unknown_sound.wav"), "");
+        assert_eq!(get_sample_category("xyz.wav"), "");
+    }
+
+    #[test]
+    fn test_read_sample_packs_empty_dir() {
+        let tmp = std::env::temp_dir().join("jdw_test_empty_samples");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let samples = read_sample_packs(&tmp.to_string_lossy());
+        assert!(samples.is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_read_sample_packs_basic() {
+        let tmp = std::env::temp_dir().join("jdw_test_samples");
+        let _ = fs::remove_dir_all(&tmp);
+        let pack_dir = tmp.join("TestPack");
+        fs::create_dir_all(&pack_dir).unwrap();
+
+        // Create some fake wav files
+        fs::write(pack_dir.join("BD_01.wav"), b"fake").unwrap();
+        fs::write(pack_dir.join("SD_01.wav"), b"fake").unwrap();
+        fs::write(pack_dir.join("notes.txt"), b"not a sample").unwrap(); // should be skipped
+
+        let samples = read_sample_packs(&tmp.to_string_lossy());
+        assert_eq!(samples.len(), 2);
+
+        let bd = &samples[0];
+        assert_eq!(bd.sample_pack, "TestPack");
+        assert_eq!(bd.category, "bd");
+        assert_eq!(bd.tone_index, 0);
+        assert!(bd.buffer_index >= 100);
+
+        let sd = &samples[1];
+        assert_eq!(sd.sample_pack, "TestPack");
+        assert_eq!(sd.category, "sn");
+        assert_eq!(sd.tone_index, 1);
+        assert_eq!(sd.buffer_index, bd.buffer_index + 1, "buffer_index should increment globally");
+
+        // Check OSC args
+        let bd_args = bd.as_osc_args();
+        assert_eq!(bd_args.len(), 5);
+        assert!(matches!(&bd_args[0], rosc::OscType::String(p) if p.contains("BD_01.wav")));
+        assert_eq!(bd_args[1], rosc::OscType::String("TestPack".to_string()));
+        assert!(matches!(bd_args[2], rosc::OscType::Int(_)));
+        assert_eq!(bd_args[3], rosc::OscType::String("bd".to_string()));
+        assert_eq!(bd_args[4], rosc::OscType::Int(0));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_buffer_index_starts_at_100() {
+        let tmp = std::env::temp_dir().join("jdw_test_buf_idx");
+        let _ = fs::remove_dir_all(&tmp);
+        let pack_dir = tmp.join("P");
+        fs::create_dir_all(&pack_dir).unwrap();
+        fs::write(pack_dir.join("test.wav"), b"fake").unwrap();
+
+        let samples = read_sample_packs(&tmp.to_string_lossy());
+        assert_eq!(samples[0].buffer_index, 100);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_get_default_samples_builds_messages() {
+        let tmp = std::env::temp_dir().join("jdw_test_def_samples");
+        let _ = fs::remove_dir_all(&tmp);
+        let pack_dir = tmp.join("P");
+        fs::create_dir_all(&pack_dir).unwrap();
+        fs::write(pack_dir.join("BD.wav"), b"fake").unwrap();
+
+        let msgs = get_default_samples(&tmp.to_string_lossy());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].osc_args.len(), 5);
+        // /load_sample args: [path, pack, buffer, category, tone_index]
+        assert!(matches!(&msgs[0].osc_args[0], rosc::OscType::String(p) if p.ends_with("BD.wav")));
+        assert_eq!(msgs[0].osc_args[2], rosc::OscType::Int(100));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_skip_hidden_dirs() {
+        let tmp = std::env::temp_dir().join("jdw_test_hidden");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".git")).unwrap();
+        fs::write(tmp.join(".git").join("test.wav"), b"fake").unwrap();
+        let pack_dir = tmp.join("RealPack");
+        fs::create_dir_all(&pack_dir).unwrap();
+        fs::write(pack_dir.join("real.wav"), b"fake").unwrap();
+
+        let samples = read_sample_packs(&tmp.to_string_lossy());
+        assert_eq!(samples.len(), 1, "should skip hidden dirs like .git");
+        assert_eq!(samples[0].sample_pack, "RealPack");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}
+
 /// Build `SampleLoadMessage`s for all discovered samples, with pre-built OSC args.
 pub fn get_default_samples(samples_root: &str) -> Vec<SampleLoadMessage> {
     read_sample_packs(samples_root)

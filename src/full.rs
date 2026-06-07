@@ -913,7 +913,12 @@ pub fn build_billboard(grouped: &GroupedBillboard) -> Billboard {
                 .iter()
                 .filter_map(|e| {
                     let ed = parse_effect(&e.content).ok()?;
-                    let mut args = header.default_args.clone();
+                    // Merge: DEFAULT → header → effect inline (matching Python's
+                    // parse_orphaned_args([section_defaults, effect_args_string]))
+                    let mut args = default_args.clone();
+                    for (k, v) in &header.default_args {
+                        args.insert(k.clone(), *v);
+                    }
                     for (k, v) in ed.args {
                         if let Ok(fv) = v.parse::<f64>() {
                             args.insert(k, fv);
@@ -1762,5 +1767,158 @@ DEFAULT amp0.3
         assert_eq!(b.sections[0].tracks[0].group_override, Some("harmony".to_string()));
         let overrides = &b.sections[0].tracks[0].arg_overrides;
         assert_eq!(overrides.get("amp"), Some(&('=', 2.0)));
+    }
+
+    // ========== Effect arg inheritance tests ==========
+
+    #[test]
+    fn test_effect_inherits_header_args() {
+        // Effects inherit section header args, but effect's own args take priority
+        let source = "\
+DEFAULT amp1.0,sus0.5
+@test:synth out46,relT2
+c4
+€reverb:main mix0.3,room0.5
+";
+        let b = parse(source);
+        assert_eq!(b.sections.len(), 1);
+        assert_eq!(b.sections[0].effects.len(), 1);
+        let args = &b.sections[0].effects[0].args;
+        // Effect inherits header's relT (not set by effect)
+        assert_eq!(args.get("relT"), Some(&2.0), "effect should inherit relT from header");
+        // Effect inherits DEFAULT's sus (not set by header or effect)
+        assert_eq!(args.get("sus"), Some(&0.5), "effect should inherit sus from DEFAULT");
+        // Effect keeps its own inline args
+        assert_eq!(args.get("mix"), Some(&0.3));
+        assert_eq!(args.get("room"), Some(&0.5));
+        // Effect inherits header out=46 (NOT overridden by effect — effect doesn't set out)
+        // Note: out is from HEADER since effect line doesn't set it
+        assert_eq!(args.get("out"), Some(&46.0), "effect should inherit out from header");
+    }
+
+    #[test]
+    fn test_effect_override_header_args() {
+        // Effect inline args should override header args
+        let source = "\
+DEFAULT amp1.0
+@test:synth out46
+c4
+€reverb:a out12,mix0.3
+";
+        let b = parse(source);
+        let args = &b.sections[0].effects[0].args;
+        assert_eq!(args.get("out"), Some(&12.0), "effect should override header out");
+        assert_eq!(args.get("mix"), Some(&0.3));
+    }
+
+    #[test]
+    fn test_effect_without_header_inherits_default() {
+        // Effects inherit DEFAULT args when header has none
+        let source = "\
+DEFAULT amp0.5
+@test:synth
+c4
+€delay:echo time0.2
+";
+        let b = parse(source);
+        assert_eq!(b.sections.len(), 1);
+        assert_eq!(b.sections[0].effects.len(), 1);
+        let args = &b.sections[0].effects[0].args;
+        assert_eq!(args.get("amp"), Some(&0.5), "effect should inherit DEFAULT amp");
+        assert_eq!(args.get("time"), Some(&0.2), "effect should keep inline time arg");
+    }
+
+    // ========== Command parsing tests ==========
+
+    #[test]
+    fn test_create_router_command_parsed() {
+        let source = "\
+@test:synth
+c4
+/create_router 10 0
+";
+        let b = parse(source);
+        assert_eq!(b.commands.len(), 1);
+        assert_eq!(b.commands[0].address, "/create_router");
+        assert_eq!(b.commands[0].args, vec!["10".to_string(), "0".to_string()]);
+    }
+
+    #[test]
+    fn test_create_effect_command_parsed() {
+        let source = "\
+@test:synth
+c4
+/create_effect reverb r1 room0.5,mix0.3
+";
+        let b = parse(source);
+        assert_eq!(b.commands.len(), 1);
+        assert_eq!(b.commands[0].address, "/create_effect");
+        assert_eq!(b.commands[0].args.len(), 3);
+        assert_eq!(b.commands[0].args[0], "reverb");
+        assert_eq!(b.commands[0].args[1], "r1");
+        assert_eq!(b.commands[0].args[2], "room0.5,mix0.3");
+    }
+
+    #[test]
+    fn test_set_bpm_command_parsed() {
+        let source = "\
+@test:synth
+c4
+/set_bpm 126
+";
+        let b = parse(source);
+        assert_eq!(b.commands[0].address, "/set_bpm");
+        assert_eq!(b.commands[0].args[0], "126");
+    }
+
+    // ========== Multiple sections with filters ==========
+
+    #[test]
+    fn test_multiple_sections_each_with_effects() {
+        let source = "\
+@a:synth out10
+c4
+€reverb:a room0.5
+@b:synth out20
+d4
+€delay:b time0.3
+";
+        let b = parse(source);
+        assert_eq!(b.sections.len(), 2);
+        // Section a effect inherits out10
+        assert_eq!(b.sections[0].effects[0].args.get("out"), Some(&10.0));
+        // Section b effect inherits out20
+        assert_eq!(b.sections[1].effects[0].args.get("out"), Some(&20.0));
+    }
+
+    #[test]
+    fn test_drone_section_has_is_drone_flag() {
+        let source = "\
+@DR_pad:aPad susT2,amp0.8
+c4
+";
+        let b = parse(source);
+        assert_eq!(b.sections.len(), 1);
+        assert!(b.sections[0].header.is_drone);
+        // DR_ prefix stripped, so instrument is "pad", group is "aPad" (from :group syntax)
+        assert_eq!(b.sections[0].header.instrument, "pad");
+        assert_eq!(b.sections[0].header.group.as_deref(), Some("aPad"));
+        assert_eq!(b.sections[0].header.default_args.get("amp"), Some(&0.8));
+    }
+
+    #[test]
+    fn test_filter_lines_collected_all() {
+        // All >>> lines should be collected regardless of position
+        let source = "\
+send /set_bpm 120
+>>> group1
+@test:synth
+c4
+>>> group2
+";
+        let b = parse(source);
+        assert_eq!(b.filters.len(), 2);
+        assert_eq!(b.filters[0], vec!["group1"]);
+        assert_eq!(b.filters[1], vec!["group2"]);
     }
 }

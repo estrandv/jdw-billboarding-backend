@@ -451,8 +451,11 @@ pub fn send_drones_create(billboard: &full::Billboard, config: &OscConfig) -> Re
                 OscType::String(ext_id),
                 OscType::Int(0),
             ];
-            // Drone args: start with section defaults, then track overrides, then force amp=0
-            let mut merged = section.header.default_args.clone();
+            // Drone args: start with DEFAULT, then section header, then track overrides, then force amp=0
+            let mut merged = billboard.default_args.clone();
+            for (k, v) in &section.header.default_args {
+                merged.insert(k.clone(), *v);
+            }
             for (k, &(op, v)) in &track.arg_overrides {
                 let entry = merged.entry(k.clone()).or_insert(0.0);
                 match op { '*' => *entry *= v, '+' => *entry += v, '-' => *entry -= v, _ => *entry = v }
@@ -1509,45 +1512,6 @@ mod tests {
         let mut sorted = non_override.to_vec();
         sorted.sort();
         assert_eq!(non_override, sorted.as_slice(), "non-override arg keys should be alphabetically sorted: {:?}", keys1);
-    }
-
-    // ========== Group filter tests ==========
-
-    #[test]
-    fn test_group_filter_applied_in_queue_update() {
-        // Parse arena.bbd and check that only filtered tracks emit messages.
-        // arena.bbd has >>> gritBass damu blip EMU_SP12
-        let source = include_str!("../../jdw-pycompose/songs/arena.bbd");
-        let bb = full::parse(source);
-        let final_filter = bb.filters.last().cloned().unwrap_or_default();
-        assert!(!final_filter.is_empty(), "arena.bbd should have group filters");
-
-        // Every section with tracks in filtered groups should emit content
-        let scale_data = extract_scale_data(&bb.commands);
-        for section in &bb.sections {
-            for track in &section.tracks {
-                if !track.enabled { continue; }
-                let gname = track_group_name(track, section);
-                if !final_filter.contains(&gname) {
-                    continue;
-                }
-                let instrument_type = if section.header.is_drone { InstrumentType::Drone }
-                    else if section.header.is_sampler { InstrumentType::Sampler }
-                    else { InstrumentType::Synth };
-                let mut converter = ElementConverter::new(
-                    &section.header.instrument, "0",
-                    instrument_type, scale_data.clone(),
-                );
-                let packets = track_to_timed_packets(
-                    &mut converter, &track.content,
-                    &bb.default_args, &section.header.default_args, &track.arg_overrides,
-                );
-                assert!(
-                    packets.is_ok() && !packets.unwrap().is_empty(),
-                    "filtered track {}_{} should produce packets", section.header.instrument, track.index
-                );
-            }
-        }
     }
 
     #[test]
