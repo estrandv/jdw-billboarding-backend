@@ -42,10 +42,13 @@ sleep 0.5  # let tcpdump initialize
 send_marker() {
     $MYPYTHON -c "
 import socket, struct, sys
+def pad(msg):
+    need = (4 - len(msg) % 4) % 4
+    return msg + b'\x00' * need
 tag = sys.argv[1] if len(sys.argv)>1 else '?'
-addr = b'/phase_marker\x00\x00'
+addr = pad(b'/phase_marker\x00')
 _    = b',s\x00\x00'
-msg  = tag.encode() + b'\x00' * (4 - len(tag.encode()) % 4)
+msg  = pad(tag.encode() + b'\x00')
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.sendto(addr + _ + msg, ('127.0.0.1', $PCAP_PORT))
 sock.close()
@@ -88,20 +91,14 @@ $MYPYTHON -c "
 import sys
 lines = open('$TMPDIR/all.txt').readlines()
 
-# Find marker indices
-# Marker format: /phase_marker  str:setup_start  (or similar)
+# Find marker indices, handling both proper and malformed markers
 marker_positions = {}
 for i, line in enumerate(lines):
     if '/phase_marker' in line:
-        # extract the phase name from the string arg
-        if 'str:setup_start' in line:
-            marker_positions['setup_start'] = i
-        elif 'str:update_start' in line:
-            marker_positions['update_start'] = i
-        elif 'str:play_start' in line:
-            marker_positions['play_start'] = i
-        elif 'str:done' in line:
-            marker_positions['done'] = i
+        for tag in ('setup_start', 'update_start', 'play_start', 'done'):
+            if tag in line:
+                marker_positions[tag] = i
+                break
 
 # Write per-phase files
 phases = [
