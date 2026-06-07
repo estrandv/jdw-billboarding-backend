@@ -23,7 +23,7 @@ pub struct MacroCall {
 /// Find all macro definition lines.
 pub fn find_macro_defs(source: &str) -> Vec<String> {
     let re = Regex::new(
-        r"\$[a-z|_]+(?:\([0-9a-zA-Z,]+\))?\s+?=\s+?(.*)",
+        r"\$[a-z|_]+(?:\([0-9a-zA-Z, ]+\))?\s+?=\s+?(.*)",
     )
     .unwrap();
     re.find_iter(source)
@@ -33,7 +33,7 @@ pub fn find_macro_defs(source: &str) -> Vec<String> {
 
 /// Find all macro call references (definitions/calls with $name or $name(...)).
 pub fn find_macro_calls(source: &str) -> Vec<String> {
-    let re = Regex::new(r"\$[a-z|_]+(?:\([0-9a-zA-Z,]+\))?").unwrap();
+    let re = Regex::new(r"\$[a-z|_]+(?:\([0-9a-zA-Z, ]+\))?").unwrap();
     re.find_iter(source)
         .map(|m| m.as_str().to_string())
         .collect()
@@ -181,6 +181,35 @@ mod tests {
 
     #[test]
     fn test_basic_macro() {
+        let source = "$fish = Sometimes I dream of fish
+$fish";
+        let result = compile_macros(source, &[]).unwrap();
+        assert_eq!(result.trim(), "Sometimes I dream of fish");
+    }
+
+    #[test]
+    fn test_macro_with_equals_in_body() {
+        // Template macros like $hpf(gen,floor) = $:gen = HPF.ar(...)
+        // have = in the body, which should be preserved
+        let source = "$hpf(gen,floor) = $:gen = HPF.ar(in: $:gen, freq: $:floor)
+$hpf(osc, 500)";
+        let result = compile_macros(source, &[]).unwrap();
+        assert!(!result.contains("$:gen"), "placeholder $:gen should be resolved");
+        assert!(!result.contains("$:floor"), "placeholder $:floor should be resolved");
+        assert!(result.contains("HPF.ar"), "HPF should be present");
+    }
+
+    #[test]
+    fn test_find_macro_defs_template_style() {
+        // Verify find_macro_defs matches template-style macros
+        let defs = find_macro_defs("$args = freq440,amp1\n$adsr(gen) = $:gen = EnvGen.ar(...)");
+        assert_eq!(defs.len(), 2);
+        assert!(defs[0].contains("$args"));
+        assert!(defs[1].contains("$adsr"));
+    }
+
+    #[test]
+    fn test_basic_macro_fish() {
         let source = "$fish = Sometimes I dream of fish
 $fish";
         let result = compile_macros(source, &[]).unwrap();
