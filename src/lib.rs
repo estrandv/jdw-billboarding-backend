@@ -1,5 +1,6 @@
 pub mod shuttle;
 pub mod billboard;
+pub mod full;
 pub mod osc;
 
 pub use billboard::{Billboard, Track};
