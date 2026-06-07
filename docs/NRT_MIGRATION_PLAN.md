@@ -152,6 +152,20 @@ used by the track are preloaded (not all samples).
 
 Port Python's `Listener` class — a blocking wait for NRT completion.
 
+**This is new infrastructure.** The Rust codebase currently only *sends* OSC;
+this requires *receiving* it. The Listener spawns a background UDP OSC server on port
+13456 that subscribes to `/nrt_record_finished` responses from jdw-sc (routed
+back via the osc-router at 13339). After the NRT render completes, jdw-sc sends
+`/nrt_record_finished "SUCCESS" <filename>` which the Listener receives and
+unblocks `wait_for()`.
+
+Key design points:
+- Uses a background thread with a blocking UDP socket (not async)
+- Only needs to handle ONE response type (`/nrt_record_finished`)
+- Must time out (5s default) to prevent hanging indefinitely
+- The OSC router must be configured to forward `/nrt_record_finished` to
+  the listener's port (via `/subscribe` message sent during setup)
+
 ### Stage 3a — Listener structure (TEST FIRST)
 
 **Test:** `test_listener_start_stop` — create listener, verify it binds to
@@ -201,12 +215,46 @@ Add NRT config keys to `JdwConfig`:
 | External IDs | Same | Same (both use `{nodeId}`) |
 | Effects/drones | Created during setup | Sent as t=0 timed messages in preload |
 
-## Implementation Order
+## Phase 5 — OSC Comparison and Regression Tests
+
+Before declaring NRT complete, verify the Rust output matches Python's NRT
+output for arena.bbd (same approach as the live play comparison).
+
+### Stage 5a — Capture Python NRT dump
+
+Extend `capture_compare.sh` with a `--nrt` phase:
+```bash
+./capture_compare.sh --nrt arena.bbd
+```
+Captures `python3 run.py --nrt arena.bbd` on port 13339.
+
+### Stage 5b — Rust NRT dump
+
+Extend `dump_osc` example with `--phase nrt` that calls `dump_nrt_bundles()`.
+
+### Stage 5c — Comparison
+
+Same diff workflow as play phase:
+- Compare bundle types (`nrt_preload`, `nrt_record`)
+- Compare `/nrt_record_info` args (BPM, filename, end_beat)
+- Compare timed message counts per track
+- Compare external IDs and arg values
+
+### Stage 5d — Regression test suite
+
+Based on the verified comparison, add high-level integration tests:
+- `test_nrt_arena_bundle_count` — correct number of tracks x bundles
+- `test_nrt_arena_bpm` — BPM from command propagated correctly
+- `test_nrt_arena_preload_messages` — right synthdefs and samples preloaded
+- `test_nrt_arena_timed_messages` — note counts match Python per track
+
+## Implementation Order (updated)
 
 1. **Phase 1 (Score)** — pure logic, no OSC, easy to test
 2. **Phase 2 (NRT Bundles)** — builds on Score + existing OSC infrastructure
 3. **Phase 3 (Listener)** — blocking UDP listener
 4. **Phase 4 (jdw-suite)** — CLI integration
+5. **Phase 5 (Comparison)** — capture Python NRT, diff, regression tests
 
 Each phase has test-first stages. No stage should be marked complete until its
 tests pass.
