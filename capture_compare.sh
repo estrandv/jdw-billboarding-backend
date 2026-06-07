@@ -28,8 +28,12 @@ trap cleanup EXIT
 
 header "Starting single-run comparison for: $SONG_NAME"
 
-# ---- Start tcpdump (single sudo, captures everything) ----
-info "Starting tcpdump (sudo) on port $PCAP_PORT..."
+# ---- Validate sudo once (prompts for password, caches session) ----
+info "Validating sudo (enter password once)..."
+sudo -v
+
+# ---- Start tcpdump (single sudo, captures everything, no re-prompt needed) ----
+info "Starting tcpdump on port $PCAP_PORT..."
 sudo tcpdump -i lo -U -w "$PCAP" udp port "$PCAP_PORT" &
 TCPDUMP_PID=$!
 sleep 0.5  # let tcpdump initialize
