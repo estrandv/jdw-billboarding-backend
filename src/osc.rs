@@ -807,6 +807,38 @@ pub fn dump_queue_update(
     lines
 }
 
+/// Dump all setup messages (synthdef loading) as human-readable text.
+pub fn dump_setup(synthdefs: &[crate::synthdefs::SynthDefMessage]) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("--- SETUP ({} synthdefs) ---", synthdefs.len()));
+    for (i, def) in synthdefs.iter().enumerate() {
+        lines.push(format!("  [{}] /create_synthdef \"{}\"", i, truncate_for_dump(&def.content, 60)));
+    }
+    lines
+}
+
+/// Dump all command messages as human-readable text.
+pub fn dump_commands(billboard: &full::Billboard) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("--- COMMANDS ({} commands) ---", billboard.commands.len()));
+    for (i, cmd) in billboard.commands.iter().enumerate() {
+        let args: Vec<OscType> = cmd.args.iter().map(|a| osc_arg_from_str(a)).collect();
+        let args_str: Vec<String> = args.iter().map(|a| osc_type_to_string(a)).collect();
+        lines.push(format!("  [{}] {} {}", i, cmd.address, args_str.join(" ")));
+    }
+    lines
+}
+
+/// Truncate a long string for dump display.
+fn truncate_for_dump(s: &str, max: usize) -> String {
+    let clean = s.replace('\n', "\\n");
+    if clean.len() <= max {
+        clean
+    } else {
+        format!("{}...", &clean[..max])
+    }
+}
+
 fn osc_type_to_string(t: &OscType) -> String {
     match t {
         OscType::String(s) => format!("\"{}\"", s),

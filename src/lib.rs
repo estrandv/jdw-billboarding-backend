@@ -11,7 +11,7 @@ pub use full::{
     Billboard, BillboardCommand, CommandContext, EffectDefinition, SynthHeader, SynthSection,
     TrackDefinition,
 };
-pub use osc::{dump_queue_update, OscConfig};
+pub use osc::{dump_queue_update, dump_setup, dump_commands, OscConfig};
 pub use synthdefs::{load_synthdefs, SynthDefMessage};
 pub use macros::{compile_macros, load_and_expand};
 
