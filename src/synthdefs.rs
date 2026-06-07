@@ -128,6 +128,25 @@ fn compile_template(definition: &str) -> Result<String, String> {
 /// Load raw SynthDefs from an SCD file containing `SynthDef.new(...)` blocks.
 ///
 /// Returns (name, full_synthdef_string) pairs.
+/// Strip trailing `//` comment lines and whitespace from a SynthDef string.
+///
+/// Needed because `load_synthdefs_from_scd` splits on `SynthDef.new` and
+/// everything up to the NEXT definition is included — including separator
+/// comments like `// Effects below` that sit between definitions.
+fn strip_trailing_sc_comments(scd: &str) -> String {
+    let mut lines: Vec<&str> = scd.lines().collect();
+    // Remove trailing blank lines and comment-only lines
+    while let Some(last) = lines.last() {
+        let trimmed = last.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            lines.pop();
+        } else {
+            break;
+        }
+    }
+    lines.join("\n")
+}
+
 fn load_synthdefs_from_scd(path: &str) -> Result<Vec<SynthDefMessage>, String> {
     let content =
         fs::read_to_string(path).map_err(|e| format!("read {}: {}", path, e))?;
@@ -141,13 +160,16 @@ fn load_synthdefs_from_scd(path: &str) -> Result<Vec<SynthDefMessage>, String> {
         }
         // Each cut starts with `("name", ...)` — reconstruct
         let full = format!("SynthDef.new{}", cut);
+        // Strip trailing comments and whitespace that belong to the NEXT synthdef
+        // e.g. "samplerALT {...}) // Effects below \n\n" → "samplerALT {...})"
+        let clean = strip_trailing_sc_comments(&full);
         // Extract name from the first quoted string
-        if let Some(start) = full.find('"') {
-            if let Some(end) = full[start + 1..].find('"') {
-                let name = full[start + 1..start + 1 + end].to_string();
+        if let Some(start) = clean.find('"') {
+            if let Some(end) = clean[start + 1..].find('"') {
+                let name = clean[start + 1..start + 1 + end].to_string();
                 result.push(SynthDefMessage {
                     name,
-                    content: full,
+                    content: clean,
                 });
             }
         }
