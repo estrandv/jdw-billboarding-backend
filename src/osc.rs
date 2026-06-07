@@ -10,6 +10,303 @@ use rosc::{OscMessage, OscPacket, OscTime, OscType};
 use jdw_osc_lib::model::TimedOSCPacket;
 
 use crate::full::{self, resolve_args};
+use crate::shuttle::ResolvedElement;
+use crate::note_utils;
+
+// -- ElementConverter (external ID scheme, frequency resolution, OSC routing) --
+
+/// The type of instrument for OSC routing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InstrumentType {
+    Sampler,
+    Synth,
+    Drone,
+}
+
+/// Scale data for resolving shuttle note indices to frequencies.
+#[derive(Debug, Clone)]
+pub struct ScaleData {
+    pub scale_key: String,
+    pub scale_type: String,
+    pub octave_start: i32,
+}
+
+impl Default for ScaleData {
+    fn default() -> Self {
+        ScaleData {
+            scale_key: "c".to_string(),
+            scale_type: "maj".to_string(),
+            octave_start: 4,
+        }
+    }
+}
+
+/// A resolved element paired with its OSC message.
+#[derive(Debug, Clone)]
+pub struct ElementMessage {
+    pub element: ResolvedElement,
+    pub message: OscPacket,
+}
+
+/// Stateful converter that resolves shuttle elements to OSC messages with
+/// unique external IDs containing the `{nodeId}` template.
+#[derive(Debug, Clone)]
+pub struct ElementConverter {
+    pub instrument_name: String,
+    pub common_identifier: String,
+    pub instrument_type: InstrumentType,
+    pub external_id_override: String,
+    pub scale_data: ScaleData,
+    pub id_counter: u32,
+}
+
+// Default delay in ms for OSC messages sent to the router.
+const SC_DELAY_MS: i32 = 70;
+
+/// Check if a resolved element matches a given symbol (e.g., `x` for silence).
+fn is_symbol(element: &ResolvedElement, sym: &str) -> bool {
+    element.suffix.to_lowercase() == sym
+        && element.prefix.is_empty()
+        && element.index == 0
+}
+
+/// Check if the first `n` characters of `s` match a pattern.
+fn begins_with(s: &str, pat: &str) -> bool {
+    s.starts_with(pat)
+}
+
+/// Strip the first `n` characters from a string.
+fn cut_first(s: &str, n: usize) -> String {
+    if n >= s.len() {
+        String::new()
+    } else {
+        s[n..].to_string()
+    }
+}
+
+/// Convert resolved element args to a flat OSC arg list, inserting overrides.
+fn args_as_osc(args: &HashMap<String, f64>, overrides: &[OscType]) -> Vec<OscType> {
+    let mut osc_args: Vec<OscType> = overrides.to_vec();
+    for (key, val) in args {
+        if !overrides.iter().any(|o| matches!(o, OscType::String(s) if s == key)) {
+            osc_args.push(OscType::String(key.clone()));
+            osc_args.push(OscType::Float(*val as f32));
+        }
+    }
+    osc_args
+}
+
+impl ElementConverter {
+    pub fn new(
+        instrument_name: &str,
+        common_identifier: &str,
+        instrument_type: InstrumentType,
+        scale_data: ScaleData,
+    ) -> Self {
+        ElementConverter {
+            instrument_name: instrument_name.to_string(),
+            common_identifier: common_identifier.to_string(),
+            instrument_type,
+            external_id_override: String::new(),
+            scale_data,
+            id_counter: 0,
+        }
+    }
+
+    pub fn resolve_message(&mut self, element: &ResolvedElement, transpose_steps: i32) -> Option<ElementMessage> {
+        if begins_with(&element.suffix, "@") {
+            let override_id = cut_first(&element.suffix, 1);
+            Some(ElementMessage {
+                element: element.clone(),
+                message: self.to_note_mod(element, transpose_steps, &override_id),
+            })
+        } else if is_symbol(element, "x") {
+            Some(ElementMessage {
+                element: element.clone(),
+                message: OscPacket::Message(OscMessage {
+                    addr: "/empty_msg".to_string(),
+                    args: vec![],
+                }),
+            })
+        } else if is_symbol(element, ".") {
+            None
+        } else if is_symbol(element, "§") {
+            Some(ElementMessage {
+                element: element.clone(),
+                message: OscPacket::Message(OscMessage {
+                    addr: "/jdw_sc_event_trigger".to_string(),
+                    args: vec![
+                        OscType::String("loop_started".to_string()),
+                        OscType::Int(SC_DELAY_MS),
+                    ],
+                }),
+            })
+        } else if begins_with(&element.suffix, "$") {
+            let override_id = cut_first(&element.suffix, 1);
+            Some(ElementMessage {
+                element: element.clone(),
+                message: self.to_note_on(element, &override_id, transpose_steps),
+            })
+        } else if self.instrument_type == InstrumentType::Drone {
+            Some(ElementMessage {
+                element: element.clone(),
+                message: self.to_note_mod(element, transpose_steps, ""),
+            })
+        } else if self.instrument_type == InstrumentType::Sampler {
+            Some(ElementMessage {
+                element: element.clone(),
+                message: self.to_play_sample(element),
+            })
+        } else {
+            Some(ElementMessage {
+                element: element.clone(),
+                message: self.to_note_on_timed(element, transpose_steps),
+            })
+        }
+    }
+
+    fn resolve_external_id(&mut self, element: &ResolvedElement) -> String {
+        if !element.suffix.is_empty() {
+            return element.suffix.clone();
+        }
+        let node_id = self.id_counter;
+        self.id_counter += 1;
+        format!(
+            "{}_{}_{}{}_{}_{{nodeId}}",
+            self.common_identifier,
+            self.instrument_name,
+            node_id,
+            element.index,
+            node_id,
+        )
+    }
+
+    fn resolve_freq(&self, element: &ResolvedElement, transpose_steps: i32) -> f64 {
+        if let Some(freq) = element.args.get("freq") {
+            return *freq;
+        }
+
+        let letter_check = note_utils::note_letter_to_midi(&element.prefix);
+
+        if letter_check == -1 {
+            let index = note_utils::resolve_index(
+                element.index as i32,
+                &self.scale_data.scale_key,
+                &self.scale_data.scale_type,
+            );
+            let octave = self.scale_data.octave_start;
+            let extra = if octave > 0 { 12 * (octave + 1) } else { 0 };
+            let new_index = (index + extra + transpose_steps) as f64;
+            note_utils::midi_to_hz(new_index)
+        } else {
+            // Letter name with octave number
+            let extra = if element.index > 0 { 12 * (element.index as i32 - 1) } else { 0 };
+            let new_index = (letter_check + extra + transpose_steps) as f64;
+            note_utils::midi_to_hz(new_index)
+        }
+    }
+
+    fn to_note_mod(&mut self, element: &ResolvedElement, transpose_steps: i32, external_id_override: &str) -> OscPacket {
+        let effective_override = if external_id_override.is_empty() {
+            self.external_id_override.clone()
+        } else {
+            external_id_override.to_string()
+        };
+        let external_id = if effective_override.is_empty() {
+            self.resolve_external_id(element)
+        } else {
+            effective_override
+        };
+        let freq = self.resolve_freq(element, transpose_steps);
+        let osc_args = args_as_osc(&element.args, &[
+            OscType::String("freq".to_string()),
+            OscType::Float(freq as f32),
+        ]);
+        OscPacket::Message(OscMessage {
+            addr: "/note_modify".to_string(),
+            args: {
+                let mut v = vec![
+                    OscType::String(external_id),
+                    OscType::Int(SC_DELAY_MS),
+                ];
+                v.extend(osc_args);
+                v
+            },
+        })
+    }
+
+    fn to_note_on_timed(&mut self, element: &ResolvedElement, transpose_steps: i32) -> OscPacket {
+        let freq = self.resolve_freq(element, transpose_steps);
+        let external_id = self.resolve_external_id(element);
+        let sus = element.args.get("sus").copied().unwrap_or(0.0);
+        let gate_time = format!("{}", sus);
+        let osc_args = args_as_osc(&element.args, &[
+            OscType::String("freq".to_string()),
+            OscType::Float(freq as f32),
+        ]);
+        OscPacket::Message(OscMessage {
+            addr: "/note_on_timed".to_string(),
+            args: {
+                let mut v = vec![
+                    OscType::String(self.instrument_name.clone()),
+                    OscType::String(external_id),
+                    OscType::String(gate_time),
+                    OscType::Int(SC_DELAY_MS),
+                ];
+                v.extend(osc_args);
+                v
+            },
+        })
+    }
+
+    fn to_play_sample(&mut self, element: &ResolvedElement) -> OscPacket {
+        let freq = self.resolve_freq(element, 0);
+        let external_id = self.resolve_external_id(element);
+        let osc_args = args_as_osc(&element.args, &[
+            OscType::String("freq".to_string()),
+            OscType::Float(freq as f32),
+        ]);
+        OscPacket::Message(OscMessage {
+            addr: "/play_sample".to_string(),
+            args: {
+                let mut v = vec![
+                    OscType::String(external_id),
+                    OscType::String(self.instrument_name.clone()),
+                    OscType::Int(element.index as i32),
+                    OscType::String(element.prefix.clone()),
+                    OscType::Int(SC_DELAY_MS),
+                ];
+                v.extend(osc_args);
+                v
+            },
+        })
+    }
+
+    fn to_note_on(&mut self, element: &ResolvedElement, external_id_override: &str, transpose_steps: i32) -> OscPacket {
+        let external_id = if external_id_override.is_empty() {
+            self.resolve_external_id(element)
+        } else {
+            external_id_override.to_string()
+        };
+        let freq = self.resolve_freq(element, transpose_steps);
+        let osc_args = args_as_osc(&element.args, &[
+            OscType::String("freq".to_string()),
+            OscType::Float(freq as f32),
+        ]);
+        OscPacket::Message(OscMessage {
+            addr: "/note_on".to_string(),
+            args: {
+                let mut v = vec![
+                    OscType::String(self.instrument_name.clone()),
+                    OscType::String(external_id),
+                    OscType::Int(SC_DELAY_MS),
+                ];
+                v.extend(osc_args);
+                v
+            },
+        })
+    }
+}
 
 fn f64_to_bigdecimal(val: f64) -> BigDecimal {
     BigDecimal::from_str(&format!("{}", val)).unwrap_or_else(|_| BigDecimal::from(1))
@@ -72,6 +369,30 @@ pub fn send_free_notes(alias: &str, config: &OscConfig) -> Result<(), String> {
     send_to_router(&sock, &config.router_addr, &msg)
 }
 
+/// Silence drone synths: send `/note_modify amp=0.0` for each drone section.
+pub fn send_silence_drones(billboard: &full::Billboard, config: &OscConfig) -> Result<(), String> {
+    let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
+
+    for section in &billboard.sections {
+        if !section.header.is_drone {
+            continue;
+        }
+        // Generate a simple external ID pattern that matches drone notes
+        let ext_id = format!(".*{}.*", regex::escape(&section.header.instrument));
+        let msg = OscPacket::Message(OscMessage {
+            addr: "/note_modify".to_string(),
+            args: vec![
+                OscType::String(ext_id),
+                OscType::Int(0),
+                OscType::String("amp".to_string()),
+                OscType::Float(0.0),
+            ],
+        });
+        send_to_router(&sock, &config.router_addr, &msg)?;
+    }
+    Ok(())
+}
+
 // -- Internal helpers --
 
 fn send_to_router(sock: &UdpSocket, addr: &str, packet: &OscPacket) -> Result<(), String> {
@@ -84,6 +405,21 @@ fn send_to_router(sock: &UdpSocket, addr: &str, packet: &OscPacket) -> Result<()
 // ---------------------------------------------------------------------------
 // Full Billboard OSC conversion (Stage 5+)
 // ---------------------------------------------------------------------------
+
+/// Extract scale data from billboard commands (`/set_scale`), or return a
+/// sensible default (C major, octave 4).
+fn extract_scale_data(commands: &[full::BillboardCommand]) -> ScaleData {
+    for cmd in commands {
+        if cmd.address == "/set_scale" && cmd.args.len() >= 3 {
+            return ScaleData {
+                scale_key: cmd.args[0].clone(),
+                scale_type: cmd.args[1].clone(),
+                octave_start: cmd.args[2].parse().unwrap_or(4),
+            };
+        }
+    }
+    ScaleData::default()
+}
 
 /// Collect all unique synths from a full Billboard and send `/read_scd` setup.
 pub fn send_full_setup(billboard: &full::Billboard, config: &OscConfig) -> Result<(), String> {
@@ -209,18 +545,16 @@ fn track_alias(synth: &str, section_index: usize, track: &full::TrackDefinition)
         .unwrap_or_else(|| format!("{}_{}_{}", synth, section_index, track.index))
 }
 
-/// Convert a track's shuttle notation to `TimedOSCPacket`s with relative beats.
+/// Convert a track's shuttle notation to `TimedOSCPacket`s using an
+/// `ElementConverter` for proper OSC routing, external IDs, and freq resolution.
 ///
-/// Each packet's `time` is the note duration (beat offset until the next event),
-/// matching what the sequencer's `to_sequence()` expects.
-pub fn full_track_to_timed_packets(
-    synth_name: &str,
-    section_index: usize,
-    track: &full::TrackDefinition,
+/// Each packet's `time` is the note duration (beat offset until the next event).
+fn track_to_timed_packets(
+    converter: &mut ElementConverter,
+    content: &str,
     resolved_args: &HashMap<String, f64>,
-    config: &OscConfig,
 ) -> Result<Vec<TimedOSCPacket>, String> {
-    let elements = crate::shuttle::parse(&track.content)?;
+    let elements = crate::shuttle::parse(content)?;
     let mut packets = Vec::new();
 
     for elem in &elements {
@@ -229,41 +563,30 @@ pub fn full_track_to_timed_packets(
             full_args.insert(k.clone(), *v);
         }
 
-        let note_len = full_args.get("time").copied().unwrap_or(1.0);
-        let gate = full_args.get("sus").copied().unwrap_or(note_len * 0.8);
-        let pitch = format!("{}{}{}", elem.prefix, elem.index, elem.suffix);
-
-        let msg = OscMessage {
-            addr: "/note_on_timed".to_string(),
-            args: vec![
-                OscType::String(synth_name.to_string()),
-                OscType::String(format!(
-                    "{}_{}_{}_{}_{{nodeId}}",
-                    synth_name, section_index, track.index, config.external_id_counter
-                )),
-                OscType::Float(gate as f32),
-                OscType::Float(0.0),
-                OscType::String(pitch),
-            ],
-        };
-
-        let time = f64_to_bigdecimal(note_len);
-        packets.push(TimedOSCPacket {
-            time,
-            packet: OscPacket::Message(msg),
-        });
+        match converter.resolve_message(elem, 0) {
+            None => continue,
+            Some(msg) => {
+                let note_len = full_args.get("time").copied().unwrap_or(1.0);
+                let time = f64_to_bigdecimal(note_len);
+                packets.push(TimedOSCPacket {
+                    time,
+                    packet: msg.message,
+                });
+            }
+        }
     }
 
     Ok(packets)
 }
 
 /// Send a full Billboard's tracks as sequencer queue updates, using the
-/// correct jdw-suite bundle protocol.
+/// correct jdw-suite bundle protocol and ElementConverter.
 pub fn send_full_queue_update(
     billboard: &full::Billboard,
     config: &OscConfig,
 ) -> Result<(), String> {
     let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
+    let scale_data = extract_scale_data(&billboard.commands);
     let mut update_bundles = Vec::new();
 
     for (si, section) in billboard.sections.iter().enumerate() {
@@ -273,21 +596,38 @@ pub fn send_full_queue_update(
             if !track.enabled {
                 continue;
             }
-            let resolved = resolve_args(&billboard.default_args, header_args, &track.arg_overrides);
-            let timed_packets = full_track_to_timed_packets(
+
+            let instrument_type = if section.header.is_drone {
+                InstrumentType::Drone
+            } else if section.header.is_sampler {
+                InstrumentType::Sampler
+            } else {
+                InstrumentType::Synth
+            };
+
+            let mut converter = ElementConverter::new(
                 &section.header.instrument,
-                si,
-                track,
-                &resolved,
-                config,
-            )?;
+                &track.index.to_string(),
+                instrument_type,
+                scale_data.clone(),
+            );
+
+            if section.header.is_drone {
+                converter.external_id_override = format!(
+                    "effect_{}_{}",
+                    section.header.group.as_deref().unwrap_or(""),
+                    track.index
+                );
+            }
+
+            let resolved = resolve_args(&billboard.default_args, header_args, &track.arg_overrides);
+            let timed_packets = track_to_timed_packets(&mut converter, &track.content, &resolved)?;
 
             if timed_packets.is_empty() {
                 continue;
             }
 
             let alias = track_alias(&section.header.instrument, si, track);
-            // one_shot = false for looped tracks (they keep repeating)
             let bundle = build_update_queue_bundle(&alias, false, &timed_packets);
             update_bundles.push(bundle);
         }
@@ -337,21 +677,12 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn test_full_track_to_timed_packets_basic() {
-        let track = full::TrackDefinition {
-            content: "c4 d4 e4".to_string(),
-            group_override: None,
-            arg_overrides: HashMap::new(),
-            index: 0,
-            enabled: true,
-        };
-        let config = OscConfig::default();
+    fn test_track_to_timed_packets_basic() {
+        let mut converter = ElementConverter::new("testSynth", "0", InstrumentType::Synth, ScaleData::default());
         let resolved = HashMap::new();
-        let packets =
-            full_track_to_timed_packets("testSynth", 0, &track, &resolved, &config).unwrap();
+        let packets = track_to_timed_packets(&mut converter, "c4 d4 e4", &resolved).unwrap();
         assert_eq!(packets.len(), 3);
 
-        // Each note has note_len=1.0 (default), so each packet.time = 1.0
         assert_eq!(packets[0].time, f64_to_bigdecimal(1.0));
         assert_eq!(packets[1].time, f64_to_bigdecimal(1.0));
         assert_eq!(packets[2].time, f64_to_bigdecimal(1.0));
@@ -359,49 +690,30 @@ mod tests {
         if let OscPacket::Message(ref msg) = packets[0].packet {
             assert_eq!(msg.addr, "/note_on_timed");
             assert_eq!(msg.args[0], OscType::String("testSynth".to_string()));
-            assert_eq!(msg.args[4], OscType::String("c4".to_string()));
         } else {
             panic!("Expected message");
         }
     }
 
     #[test]
-    fn test_full_track_to_timed_packets_with_args() {
-        let track = full::TrackDefinition {
-            content: "c4:time0.5 d4:time1.5 e4".to_string(),
-            group_override: None,
-            arg_overrides: HashMap::new(),
-            index: 0,
-            enabled: true,
-        };
-        let config = OscConfig::default();
-        let resolved = HashMap::new();
-        let packets =
-            full_track_to_timed_packets("s", 0, &track, &resolved, &config).unwrap();
+    fn test_track_to_timed_packets_with_args() {
+        let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
+        let packets = track_to_timed_packets(&mut converter, "c4:time0.5 d4:time1.5 e4", &HashMap::new()).unwrap();
 
         assert_eq!(packets.len(), 3);
-        // c4: time=0.5, d4: time=1.5, e4: time=1.0 (default)
         assert_eq!(packets[0].time, f64_to_bigdecimal(0.5));
         assert_eq!(packets[1].time, f64_to_bigdecimal(1.5));
         assert_eq!(packets[2].time, f64_to_bigdecimal(1.0));
     }
 
     #[test]
-    fn test_full_track_to_timed_packets_drum_samples() {
-        let track = full::TrackDefinition {
-            content: "14 26 32".to_string(),
-            group_override: None,
-            arg_overrides: HashMap::new(),
-            index: 0,
-            enabled: true,
-        };
-        let config = OscConfig::default();
-        let packets =
-            full_track_to_timed_packets("Roland808", 0, &track, &HashMap::new(), &config).unwrap();
+    fn test_track_to_timed_packets_sampler() {
+        let mut converter = ElementConverter::new("Roland808", "0", InstrumentType::Sampler, ScaleData::default());
+        let packets = track_to_timed_packets(&mut converter, "14 26 32", &HashMap::new()).unwrap();
         assert_eq!(packets.len(), 3);
         if let OscPacket::Message(ref msg) = packets[0].packet {
-            assert_eq!(msg.args[0], OscType::String("Roland808".to_string()));
-            assert_eq!(msg.args[4], OscType::String("14".to_string()));
+            assert_eq!(msg.addr, "/play_sample");
+            assert_eq!(msg.args[1], OscType::String("Roland808".to_string()));
         } else {
             panic!("Expected message");
         }

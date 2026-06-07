@@ -63,6 +63,7 @@ enum Token {
     Plus,
     Minus,
     Eq,
+    SectionMarker,
     Ident(String),
     Number(String),
 }
@@ -81,14 +82,32 @@ fn tokenize(source: &str) -> Vec<Token> {
             '+' => { tokens.push(Token::Plus); chars.next(); }
             '-' => { tokens.push(Token::Minus); chars.next(); }
             '=' => { tokens.push(Token::Eq); chars.next(); }
+            '§' => { tokens.push(Token::SectionMarker); chars.next(); }
             ' ' | '\t' | '\n' | '\r' => { chars.next(); }
-            _ if ch.is_ascii_digit() || ch == '.' => {
+            _ if ch.is_ascii_digit() => {
                 let mut s = String::new();
+                s.push(ch); chars.next();
                 while let Some(&c) = chars.peek() {
                     if c.is_ascii_digit() || c == '.' { s.push(c); chars.next(); }
                     else { break; }
                 }
                 tokens.push(Token::Number(s));
+            }
+            '.' => {
+                // Advance past the dot, then peek ahead to check if it's a decimal
+                chars.next(); // consume '.'
+                let is_decimal = chars.peek().is_some_and(|c| c.is_ascii_digit());
+                if is_decimal {
+                    let mut s = String::from(".");
+                    while let Some(&c) = chars.peek() {
+                        if c.is_ascii_digit() || c == '.' { s.push(c); chars.next(); }
+                        else { break; }
+                    }
+                    tokens.push(Token::Number(s));
+                } else {
+                    // standalone `.` is legacy alias for `x` (silence/rest)
+                    tokens.push(Token::Ident("x".into()));
+                }
             }
             _ => {
                 let mut s = String::new();
@@ -138,12 +157,27 @@ impl Cursor<'_> {
 fn parse_sequence(cursor: &mut Cursor) -> Result<Vec<Element>, String> {
     let mut elements = Vec::new();
     loop {
-        // Skip whitespace tokens (already stripped by tokenizer, but handle empty sequences)
-        if cursor.peek().is_none() || cursor.peek() == Some(&Token::RParen) || cursor.peek() == Some(&Token::Slash) {
+        if cursor.peek().is_none()
+            || cursor.peek() == Some(&Token::RParen)
+            || cursor.peek() == Some(&Token::Slash)
+        {
             break;
         }
+
+        // § marks the loop start point for keyboard — structural marker, no sound.
+        // Skip it and any following `:N` argument.
+        if cursor.peek() == Some(&Token::SectionMarker) {
+            cursor.advance();
+            if cursor.peek() == Some(&Token::Colon) {
+                cursor.advance();
+                if let Some(Token::Number(_)) = cursor.peek() {
+                    cursor.advance();
+                }
+            }
+            continue;
+        }
+
         elements.push(parse_element(cursor)?);
-        // After an element, if next is not ) or / or end, continue
     }
     Ok(elements)
 }
@@ -251,6 +285,11 @@ fn parse_args(cursor: &mut Cursor) -> HashMap<String, f64> {
     cursor.advance(); // consume ':'
 
     loop {
+        // Skip leading commas (empty arg slots like `:,arg1,arg2`)
+        while cursor.peek() == Some(&Token::Comma) {
+            cursor.advance();
+        }
+
         #[allow(unused_assignments)]
         let mut arg_name = String::new();
         let mut num_str = String::new();

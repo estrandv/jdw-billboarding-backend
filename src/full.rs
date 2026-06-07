@@ -126,6 +126,8 @@ pub fn classify_content(content: &str) -> Option<LineType> {
         } else {
             Some(LineType::TrackDefinition)
         }
+    } else if trimmed.starts_with('/') {
+        Some(LineType::Command)
     } else if trimmed.starts_with("COMMAND")
         || trimmed.starts_with("UPDATE_COMMAND")
         || trimmed.starts_with("QUEUE_COMMAND")
@@ -624,12 +626,14 @@ pub fn parse_effect(content: &str) -> Result<EffectData, String> {
 pub fn parse_command(content: &str) -> Result<CommandData, String> {
     let trimmed = content.trim();
 
-    let (context, rest) = if trimmed.starts_with("UPDATE_COMMAND") {
+    let (context, rest) = if trimmed.starts_with('/') {
+        // Bare /address — no COMMAND type prefix
+        (CommandContext::All, trimmed)
+    } else if trimmed.starts_with("UPDATE_COMMAND") {
         (CommandContext::Update, trimmed[14..].trim())
     } else if trimmed.starts_with("QUEUE_COMMAND") {
         (CommandContext::Queue, trimmed[13..].trim())
     } else if trimmed.starts_with("COMMAND") {
-        // Ensure it's "COMMAND" not just "COMMAND_SOMETHING"
         let after = &trimmed[7..];
         if after.is_empty() || after.starts_with(char::is_whitespace) {
             (CommandContext::All, after.trim())
@@ -1093,6 +1097,12 @@ mod tests {
     }
 
     #[test]
+    fn test_bare_address_command() {
+        assert_eq!(classify_content("/set_bpm 120"), Some(LineType::Command));
+        assert_eq!(classify_content("/free_notes"), Some(LineType::Command));
+    }
+
+    #[test]
     fn test_default_not_mistaken_for_track() {
         // "DEFAULTS" should not match DEFAULT
         assert_eq!(classify_content("DEFAULTS something"), Some(LineType::TrackDefinition));
@@ -1502,6 +1512,14 @@ e4 f4
         assert_eq!(c.context, CommandContext::Queue);
         assert_eq!(c.address, "/something");
         assert!(c.args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_command_bare_address() {
+        let c = parse_command("/set_bpm 120").unwrap();
+        assert_eq!(c.context, CommandContext::All);
+        assert_eq!(c.address, "/set_bpm");
+        assert_eq!(c.args, vec!["120"]);
     }
 
     // -- parse_filter --
