@@ -1729,7 +1729,7 @@ mod tests {
 
     #[test]
     fn test_parse_real_bbd_gong() {
-        let source = include_str!("../../jdw-pycompose/songs/gong.bbd");
+        let source = include_str!("../tests/fixtures/gong.bbd");
         let bb = full::parse(source);
 
         // 10 commands + 4 UPDATE_COMMANDs... actually let's count
@@ -1744,7 +1744,7 @@ mod tests {
 
     #[test]
     fn test_parse_real_bbd_arena() {
-        let source = include_str!("../../jdw-pycompose/songs/arena.bbd");
+        let source = include_str!("../tests/fixtures/arena.bbd");
         let bb = full::parse(source);
 
         assert!(!bb.commands.is_empty());
@@ -2091,7 +2091,7 @@ c4
 
     #[test]
     fn test_parse_real_bbd_rattlesnake() {
-        let source = include_str!("../../jdw-pycompose/songs/rattlesnake.bbd");
+        let source = include_str!("../tests/fixtures/rattlesnake.bbd");
         let bb = full::parse(source);
 
         assert!(!bb.commands.is_empty());

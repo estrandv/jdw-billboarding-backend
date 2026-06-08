@@ -1,8 +1,8 @@
-const SONGS_DIR: &str = "/home/estrandv/programming/jdw-pycompose/songs/";
+const FIXTURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
 #[test]
 fn test_all_bbd_files_parse() {
-    let dir = std::fs::read_dir(SONGS_DIR).unwrap();
+    let dir = std::fs::read_dir(FIXTURES_DIR).unwrap();
     let mut parsed = 0;
     let mut errors = Vec::new();
 
@@ -36,13 +36,15 @@ fn test_all_bbd_files_parse() {
     eprintln!("All {} .bbd files parsed successfully.", parsed);
 }
 
+fn fixture(path: &str) -> String {
+    format!("{}/{}", FIXTURES_DIR, path)
+}
+
 #[test]
 fn test_gong_bbd_parses() {
-    let gong_path = "/home/estrandv/programming/jdw-pycompose/songs/gong.bbd";
-    let content = std::fs::read_to_string(gong_path).unwrap();
+    let content = std::fs::read_to_string(fixture("gong.bbd")).unwrap();
     let billboard = jdw_billboarding_backend::parse_billboard(&content);
 
-    // SP_/DR_ prefixes are stripped from instrument name, tracked as flags
     let synth_names: Vec<&str> = billboard.sections.iter()
         .map(|s| s.header.instrument.as_str())
         .collect();
@@ -56,31 +58,28 @@ fn test_gong_bbd_parses() {
 
 #[test]
 fn test_gong_bbd_via_file_api() {
-    let gong_path = "/home/estrandv/programming/jdw-pycompose/songs/gong.bbd";
-    let billboard = jdw_billboarding_backend::parse_billboard_file(gong_path).unwrap();
+    let billboard = jdw_billboarding_backend::parse_billboard_file(&fixture("gong.bbd")).unwrap();
 
     let synth_count = billboard.sections.len();
     assert!(synth_count >= 15, "expected many synths, got {}", synth_count);
 
-    // Should have commands
     assert!(!billboard.commands.is_empty(), "expected commands");
 }
 
 #[test]
 fn test_trumpets_bbd_with_macros() {
-    let trumpets_path = "/home/estrandv/programming/jdw-pycompose/songs/trumpets.bbd";
-    let billboard = jdw_billboarding_backend::parse_billboard_file(trumpets_path).unwrap();
+    // Set bbd_root to fixtures dir so common_macros.txt is found
+    std::env::set_var("JDW_BBD_ROOT", FIXTURES_DIR);
+    let billboard = jdw_billboarding_backend::parse_billboard_file(&fixture("trumpets.bbd")).unwrap();
 
     let synth_names: Vec<&str> = billboard.sections.iter()
         .map(|s| s.header.instrument.as_str())
         .collect();
     eprintln!("trumpets synths: {:?}", synth_names);
 
-    // The $chug macro is used and should expand correctly
     assert!(synth_names.contains(&"Roland808"), "expected Roland808");
     assert!(synth_names.contains(&"trumpet"), "expected trumpet");
 
-    // Verify tracks have shuttle notation content (macros should expand)
     for section in &billboard.sections {
         for track in &section.tracks {
             assert!(!track.content.trim().is_empty(),
@@ -92,14 +91,9 @@ fn test_trumpets_bbd_with_macros() {
 
 #[test]
 fn test_trumpets_bbd_raw_fails_without_macros() {
-    // Without macro expansion, $chug references should remain unexpanded
-    // and will fail shuttle parsing later, but the billboard still parses
-    let trumpets_path = "/home/estrandv/programming/jdw-pycompose/songs/trumpets.bbd";
-    let content = std::fs::read_to_string(trumpets_path).unwrap();
-
+    let content = std::fs::read_to_string(fixture("trumpets.bbd")).unwrap();
     let billboard = jdw_billboarding_backend::parse_billboard(&content);
 
-    // Tracks with $macro calls will have their raw content preserved
     let macro_tracks: Vec<&str> = billboard.sections.iter()
         .flat_map(|s| s.tracks.iter())
         .filter(|t| t.content.contains('$'))
