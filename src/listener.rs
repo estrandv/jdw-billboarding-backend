@@ -180,7 +180,7 @@ mod tests {
     fn test_listener_wait_for_receives() {
         let listener = Listener::start(0).unwrap();
         // Send a message to the listener's port
-        let actual_port = {
+        let _actual_port = {
             // Hack: we need to know the port. Since we can't easily get it from the listener,
             // just test with a known port.
             // Let's use 13500 for test.

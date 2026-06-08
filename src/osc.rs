@@ -1973,7 +1973,7 @@ mod tests {
         let empty_header: HashMap<String, f64> = HashMap::new();
         let empty_overrides: HashMap<String, (char, f64)> = HashMap::new();
 
-        let mut collect_keys = || {
+        let collect_keys = || {
             let mut converter = ElementConverter::new("s", "0", InstrumentType::Synth, ScaleData::default());
             let packets = track_to_timed_packets(&mut converter, "c4", &defaults, &empty_header, &empty_overrides).unwrap();
             let mut kv_keys = Vec::new();
