@@ -474,6 +474,7 @@ pub fn send_drones_create(billboard: &full::Billboard, config: &OscConfig) -> Re
 }
 
 /// Convert args HashMap to flat key-value OSC args (unfiltered, no overrides).
+#[allow(dead_code)]
 fn flat_kv_args(args: &std::collections::HashMap<String, f64>) -> Vec<OscType> {
     let mut out = Vec::new();
     let mut keys: Vec<&String> = args.keys().collect();
