@@ -474,6 +474,8 @@ pub fn send_drones_create(billboard: &full::Billboard, config: &OscConfig) -> Re
 }
 
 /// Convert args HashMap to flat key-value OSC args (unfiltered, no overrides).
+/// Kept for future use — the Python equivalent is used in live setup
+/// but the Rust NRT path builds args differently via `args_as_osc`.
 #[allow(dead_code)]
 fn flat_kv_args(args: &std::collections::HashMap<String, f64>) -> Vec<OscType> {
     let mut out = Vec::new();
