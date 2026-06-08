@@ -20,6 +20,8 @@ pub struct Listener {
     stop_tx: Option<mpsc::Sender<()>>,
     /// Join handle for the background thread.
     thread: Option<thread::JoinHandle<()>>,
+    /// Bound port (useful when port 0 is used for OS-assigned port).
+    port: u16,
 }
 
 impl Listener {
@@ -32,6 +34,9 @@ impl Listener {
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
             .map_err(|e| format!("set_read_timeout: {}", e))?;
+
+        // Capture the actual bound port (OS-assigned if port was 0)
+        let port = socket.local_addr().map(|a| a.port()).unwrap_or(port);
 
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_clone = received.clone();
@@ -69,7 +74,13 @@ impl Listener {
             received,
             stop_tx: Some(stop_tx),
             thread: Some(handle),
+            port,
         })
+    }
+
+    /// Return the port this listener is bound to.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// Block until `addr` appears in received messages, with timeout.
@@ -179,20 +190,12 @@ mod tests {
     #[test]
     fn test_listener_wait_for_receives() {
         let listener = Listener::start(0).unwrap();
-        // Send a message to the listener's port
-        let _actual_port = {
-            // Hack: we need to know the port. Since we can't easily get it from the listener,
-            // just test with a known port.
-            // Let's use 13500 for test.
-            drop(listener);
-            let l = Listener::start(13500).unwrap();
-            // Send an OSC message
-            let addr = b"/nrt_record_finished\0\0\0,s\0\0SUCCESS\0";
-            let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-            sock.send_to(addr, "127.0.0.1:13500").unwrap();
-            let result = l.wait_for("/nrt_record_finished", 3);
-            assert!(result, "should receive the message");
-            drop(l);
-        };
+        let port = listener.port();
+        // Send an OSC message to the listener's port
+        let addr = b"/nrt_record_finished\0\0\0,s\0\0SUCCESS\0";
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.send_to(addr, format!("127.0.0.1:{}", port)).unwrap();
+        let result = listener.wait_for("/nrt_record_finished", 3);
+        assert!(result, "should receive the message");
     }
 }
