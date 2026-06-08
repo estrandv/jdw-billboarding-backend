@@ -82,7 +82,14 @@ fn compile_template(definition: &str) -> Result<String, String> {
         .nth(1)
         .ok_or_else(|| format!("invalid arg line in '{}': {}", name, argline))?;
 
-    let args = parse_args(arg_str);
+    let mut args = parse_args(arg_str);
+
+    // Deduplicate: when a section overrides a $args default (e.g. attT=0,attT=0.002),
+    // keep the last occurrence. sclang errors on duplicate SynthDef args.
+    let mut seen = HashSet::new();
+    args.reverse();
+    args.retain(|(k, _)| seen.insert(k.clone()));
+    args.reverse();
 
     // Lines after the args line are the SCD body
     let scd_lines: Vec<&str> = lines[argline_idx.unwrap() + 1..]
