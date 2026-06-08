@@ -968,32 +968,23 @@ pub fn dump_nrt(
             }
         }
 
-        lines.push(format!("  Preload bundles: {}", info.preload_bundles.len()));
+        lines.push(format!("  Preload bundles ({}):", info.preload_bundles.len()));
 
-        // Show nrt_record bundle structure
+        // Show preload bundle structure
+        for (bi, bundle) in info.preload_bundles.iter().enumerate() {
+            if let OscPacket::Bundle(ref b) = bundle {
+                let timed_count = b.content.iter().filter(|c| matches!(c, OscPacket::Bundle(_))).count();
+                lines.push(format!("    [{}] preload bundle ({} timed msgs)", bi, timed_count));
+            }
+        }
+
+        // Show nrt_record bundle structure (metadata only)
         if let OscPacket::Bundle(ref b) = info.nrt_bundle {
-            lines.push(format!("  nrt_record bundle ({} children):", b.content.len()));
+            lines.push(format!("  nrt_record bundle ({} children, metadata only):", b.content.len()));
             for (i, child) in b.content.iter().enumerate() {
-                match child {
-                    OscPacket::Message(ref m) => {
-                        let args: Vec<String> = m.args.iter().map(|a| osc_type_to_string(a)).collect();
-                        lines.push(format!("    [{}] {} {}", i, m.addr, args.join(" ")));
-                    }
-                    OscPacket::Bundle(ref inner) => {
-                        let msg_count = inner.content.len();
-                        lines.push(format!("    [{}] <bundle> ({} timed msgs)", i, msg_count));
-                        // Show first few messages
-                        for (j, c) in inner.content.iter().take(3).enumerate() {
-                            if let OscPacket::Bundle(ref timed) = c {
-                                if let Some(OscPacket::Message(ref m)) = timed.content.last() {
-                                    lines.push(format!("      [{}] {}", j, m.addr));
-                                }
-                            }
-                        }
-                        if msg_count > 3 {
-                            lines.push(format!("      ... and {} more", msg_count - 3));
-                        }
-                    }
+                if let OscPacket::Message(ref m) = child {
+                    let args: Vec<String> = m.args.iter().map(|a| osc_type_to_string(a)).collect();
+                    lines.push(format!("    [{}] {} {}", i, m.addr, args.join(" ")));
                 }
             }
         }
@@ -1138,7 +1129,6 @@ pub fn get_nrt_record_bundles(
         elements: Vec<crate::shuttle::ResolvedElement>,
         instrument_type: InstrumentType,
         instrument_name: String,
-        durations: Vec<f64>,
     }
 
     let mut track_metas: HashMap<String, TrackMeta> = HashMap::new();
@@ -1183,36 +1173,29 @@ pub fn get_nrt_record_bundles(
                 el
             }).collect();
 
-            let durations: Vec<f64> = resolved.iter()
-                .map(|e| e.args.get("time").copied().unwrap_or(1.0))
+            let durations: Vec<BigDecimal> = resolved.iter()
+                .map(|e| BigDecimal::from_str(&format!("{}", e.args.get("time").copied().unwrap_or(1.0))).unwrap_or_else(|_| BigDecimal::from(1)))
                 .collect();
 
             track_metas.insert(track_name.clone(), TrackMeta {
                 elements: resolved,
                 instrument_type,
                 instrument_name: section.header.instrument.clone(),
-                durations: durations.clone(),
             });
 
             score.add_source(track_name, group_name, durations);
         }
     }
 
-    // Walk group filters
-    let filters = &billboard.filters;
-    if filters.is_empty() {
-        let all_groups: Vec<String> = billboard
-            .sections.iter()
-            .flat_map(|s| s.tracks.iter().map(move |t| track_group_name(t, s)))
-            .collect();
-        score.extend_groups(&all_groups, true);
-    } else {
-        for filter_set in filters {
-            score.extend_groups(filter_set, true);
-        }
+    // Walk group filters (matching Python: only extend if explicit @filter lines exist)
+    for filter_set in &billboard.filters {
+        score.extend_groups(filter_set, true);
     }
 
     let timed_tracks = score.unpack_timed_entries();
+
+    // Global end time: max across all tracks + 8 beats (matching Python)
+    let global_end_beat: BigDecimal = score.get_end_time() + BigDecimal::from_str("8.0").unwrap();
 
     for (track_name, timed_entries) in &timed_tracks {
         let meta = match track_metas.get(track_name) {
@@ -1223,10 +1206,18 @@ pub fn get_nrt_record_bundles(
         let mut preload_msgs = vec![OscPacket::Message(OscMessage {
             addr: "/clear_nrt".to_string(), args: vec![],
         })];
-        // Filter synthdefs: only needed ones (track's instrument + samplerALT + effects)
+        // Filter synthdefs: always include router + samplerALT for NRT (matching Python).
+        // Router is needed because /create_router commands become /note_on "router"
+        // entries — without the synthdef loaded via /d_recv, scsynth can't create
+        // them and audio routing to bus 0 fails.
+        // sampler/samplerALT are needed only for sampler tracks.
         let mut needed_synth_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
         needed_synth_names.insert(meta.instrument_name.as_str());
-        needed_synth_names.insert("samplerALT"); // always needed for NRT sample playback
+        needed_synth_names.insert("router");
+        if meta.instrument_type == InstrumentType::Sampler {
+            needed_synth_names.insert("sampler");
+        }
+        needed_synth_names.insert("samplerALT");
         // Also include any synths used by this section's effects
         for section in &billboard.sections {
             if section.header.instrument == meta.instrument_name {
@@ -1243,17 +1234,36 @@ pub fn get_nrt_record_bundles(
                 }));
             }
         }
-        for sm in samples {
-            // Only load samples for sampler tracks, and only from the matching pack.
-            // Python's _filter_used_samples filters by section.header.instrument_name.
-            // Synth tracks don't need samples at all.
-            if meta.instrument_type == InstrumentType::Sampler
-                && sm.sample.sample_pack == meta.instrument_name
-            {
-                preload_msgs.push(OscPacket::Message(OscMessage {
-                    addr: "/load_sample".to_string(),
-                    args: sm.osc_args.clone(),
-                }));
+        // Build usage map for sample filtering (matching Python's _filter_used_samples)
+        let mut usage_by_category: std::collections::HashMap<String, std::collections::HashSet<u32>>
+            = std::collections::HashMap::new();
+        if meta.instrument_type == InstrumentType::Sampler {
+            for (_, src_idx) in timed_entries {
+                if let Some(idx) = src_idx {
+                    if *idx < meta.elements.len() {
+                        let elem = &meta.elements[*idx];
+                        usage_by_category.entry(elem.prefix.clone())
+                            .or_default()
+                            .insert(elem.index);
+                    }
+                }
+            }
+        }
+        if meta.instrument_type == InstrumentType::Sampler {
+            for sm in samples {
+                if sm.sample.sample_pack != meta.instrument_name { continue; }
+                // Python's _filter_used_samples: use category if present, else ""
+                let cat = if usage_by_category.contains_key(&sm.sample.category) {
+                    &sm.sample.category
+                } else {
+                    ""
+                };
+                if usage_by_category.get(cat).map_or(false, |indices| indices.contains(&sm.sample.tone_index)) {
+                    preload_msgs.push(OscPacket::Message(OscMessage {
+                        addr: "/load_sample".to_string(),
+                        args: sm.osc_args.clone(),
+                    }));
+                }
             }
         }
 
@@ -1269,7 +1279,7 @@ pub fn get_nrt_record_bundles(
                     let elem = &meta.elements[*idx];
                     match converter.resolve_message(elem, 0) {
                         Some(msg) => osc_packets.push(TimedOSCPacket {
-                            time: f64_to_bigdecimal(*time),
+                            time: time.clone(),
                             packet: msg.message,
                         }),
                         None => {} // skip
@@ -1278,7 +1288,7 @@ pub fn get_nrt_record_bundles(
                 _ => {
                     // Silence padding → /empty_message
                     osc_packets.push(TimedOSCPacket {
-                        time: f64_to_bigdecimal(*time),
+                        time: time.clone(),
                         packet: OscPacket::Message(OscMessage {
                             addr: "/empty_message".to_string(),
                             args: vec![],
@@ -1288,24 +1298,125 @@ pub fn get_nrt_record_bundles(
             }
         }
 
-        let end_beat: f64 = timed_entries.iter().map(|(t, _)| t).sum::<f64>() + 8.0;
+        let end_beat = &global_end_beat;
         let user = std::env::var("USER").unwrap_or_else(|_| "user".into());
         let file_name = format!("/home/{}/jdw_output/track_{}.wav", user, track_name);
 
-        // Build setup messages (commands + effects at t=0) for preload bundle
+        // Build setup messages (commands + effects + drones at t=0) for preload bundle.
+        // Must match Python's all_setup_messages = timed_cmd_msgs + timed_eff_msgs.
         let mut setup_packets: Vec<TimedOSCPacket> = Vec::new();
-        // Commands at t=0
+
+        // Commands: convert /create_router and /create_effect to /note_on
+        // (matching send_full_commands logic). Other commands pass through.
         for cmd in &billboard.commands {
-            let args: Vec<OscType> = cmd.args.iter().map(|a| osc_arg_from_str(a)).collect();
-            setup_packets.push(TimedOSCPacket {
-                time: f64_to_bigdecimal(0.0),
-                packet: OscPacket::Message(OscMessage {
-                    addr: cmd.address.clone(),
-                    args,
-                }),
-            });
+            match cmd.address.as_str() {
+                "/create_router" => {
+                    if cmd.args.len() >= 2 {
+                        let in_arg = &cmd.args[0];
+                        let out_arg = &cmd.args[1];
+                        let ext_id = format!("effect_router_{}_{}", in_arg, out_arg);
+                        let in_val: f32 = in_arg.parse().unwrap_or(0.0);
+                        let out_val: f32 = out_arg.parse().unwrap_or(0.0);
+                        setup_packets.push(TimedOSCPacket {
+                            time: f64_to_bigdecimal(0.0),
+                            packet: OscPacket::Message(OscMessage {
+                                addr: "/note_on".to_string(),
+                                args: vec![
+                                    OscType::String("router".to_string()),
+                                    OscType::String(ext_id),
+                                    OscType::Int(0),
+                                    OscType::String("in".to_string()),
+                                    OscType::Float(in_val),
+                                    OscType::String("out".to_string()),
+                                    OscType::Float(out_val),
+                                ],
+                            }),
+                        });
+                    }
+                }
+                "/create_effect" => {
+                    if cmd.args.len() >= 3 {
+                        let effect_name = &cmd.args[0];
+                        let effect_id = &cmd.args[1];
+                        let effect_args_str = &cmd.args[2];
+                        setup_packets.push(TimedOSCPacket {
+                            time: f64_to_bigdecimal(0.0),
+                            packet: OscPacket::Message(OscMessage {
+                                addr: "/note_on".to_string(),
+                                args: vec![
+                                    OscType::String(effect_name.clone()),
+                                    OscType::String(effect_id.clone()),
+                                    OscType::Int(0),
+                                ],
+                            }),
+                        });
+                        // /note_modify with parsed args
+                        let parsed = crate::full::parse_simple_args(effect_args_str);
+                        let mut mod_args = vec![
+                            OscType::String(effect_id.clone()),
+                            OscType::Int(0),
+                        ];
+                        let mut pairs: Vec<(&String, &String)> = parsed.iter().map(|(k,v)| (k,v)).collect();
+                        pairs.sort_by(|a, b| a.0.cmp(b.0));
+                        for (k, v) in pairs {
+                            mod_args.push(OscType::String(k.clone()));
+                            mod_args.push(osc_arg_from_str(v));
+                        }
+                        setup_packets.push(TimedOSCPacket {
+                            time: f64_to_bigdecimal(0.0),
+                            packet: OscPacket::Message(OscMessage {
+                                addr: "/note_modify".to_string(),
+                                args: mod_args,
+                            }),
+                        });
+                    }
+                }
+                _ => {
+                    // Pass-through: /set_bpm, /keyboard_*, etc.
+                    let args: Vec<OscType> = cmd.args.iter().map(|a| osc_arg_from_str(a)).collect();
+                    setup_packets.push(TimedOSCPacket {
+                        time: f64_to_bigdecimal(0.0),
+                        packet: OscPacket::Message(OscMessage {
+                            addr: cmd.address.clone(),
+                            args,
+                        }),
+                    });
+                }
+            }
         }
-        // Effects as t=0 /note_on messages
+
+        // Drones from ALL drone sections (matching Python's get_all_drones_create)
+        for section in &billboard.sections {
+            if !section.header.is_drone { continue; }
+            let group_name = section.header.group.as_deref().unwrap_or("");
+            for track in &section.tracks {
+                let ext_id = format!("effect_{}_{}", group_name, track.index);
+                let mut args = vec![
+                    OscType::String(section.header.instrument.clone()),
+                    OscType::String(ext_id),
+                    OscType::Int(0),
+                ];
+                let mut merged = billboard.default_args.clone();
+                for (k, v) in &section.header.default_args {
+                    merged.insert(k.clone(), *v);
+                }
+                for (k, &(op, v)) in &track.arg_overrides {
+                    let entry = merged.entry(k.clone()).or_insert(0.0);
+                    match op { '*' => *entry *= v, '+' => *entry += v, '-' => *entry -= v, _ => *entry = v }
+                }
+                merged.insert("amp".to_string(), 0.0);
+                args.extend(args_as_osc(&merged, &[]));
+                setup_packets.push(TimedOSCPacket {
+                    time: f64_to_bigdecimal(0.0),
+                    packet: OscPacket::Message(OscMessage {
+                        addr: "/note_on".to_string(),
+                        args,
+                    }),
+                });
+            }
+        }
+
+        // Effects for matching section (matching Python's get_section_effects_create)
         for section in &billboard.sections {
             if section.header.instrument == meta.instrument_name {
                 for effect in &section.effects {
@@ -1327,11 +1438,15 @@ pub fn get_nrt_record_bundles(
             }
         }
 
+        // Combine ALL timed messages into preload (matching Python: main bundle is metadata-only)
+        let mut all_packets = setup_packets;
+        all_packets.extend(osc_packets);
+
         results.push(NrtBundleInfo {
             track_name: track_name.clone(),
-            nrt_bundle: build_nrt_record_bundle_from_packets(&osc_packets, bpm, &file_name, end_beat),
+            nrt_bundle: build_nrt_record_bundle_meta(bpm, &file_name, &end_beat),
             preload_messages: preload_msgs,
-            preload_bundles: vec![build_nrt_preload_bundle_from_packets(&setup_packets)],
+            preload_bundles: vec![build_nrt_preload_bundle_from_packets(&all_packets)],
         });
     }
 
@@ -1339,49 +1454,17 @@ pub fn get_nrt_record_bundles(
 }
 
 /// Build nrt_preload bundle from TimedOSCPackets.
+///
+/// jdw-sc expects timed bundles as direct siblings of `/bundle_info`.
 fn build_nrt_preload_bundle_from_packets(packets: &[TimedOSCPacket]) -> OscPacket {
-    let inner = osc_bundle_from_packets(packets);
-    OscPacket::Bundle(rosc::OscBundle {
-        timetag: osc_timetag_now(),
-        content: vec![
-            OscPacket::Message(OscMessage {
-                addr: "/bundle_info".to_string(),
-                args: vec![OscType::String("nrt_preload".to_string())],
-            }),
-            inner,
-        ],
-    })
-}
-
-/// Build nrt_record bundle from TimedOSCPackets.
-fn build_nrt_record_bundle_from_packets(
-    packets: &[TimedOSCPacket], bpm: f64, file_name: &str, end_beat: f64,
-) -> OscPacket {
-    let inner = osc_bundle_from_packets(packets);
-    OscPacket::Bundle(rosc::OscBundle {
-        timetag: osc_timetag_now(),
-        content: vec![
-            OscPacket::Message(OscMessage {
-                addr: "/bundle_info".to_string(),
-                args: vec![OscType::String("nrt_record".to_string())],
-            }),
-            OscPacket::Message(OscMessage {
-                addr: "/nrt_record_info".to_string(),
-                args: vec![
-                    OscType::Float(bpm as f32),
-                    OscType::String(file_name.to_string()),
-                    OscType::Float(end_beat as f32),
-                ],
-            }),
-            inner,
-        ],
-    })
-}
-
-/// Build a plain OSC bundle from TimedOSCPackets (no outer tag).
-fn osc_bundle_from_packets(packets: &[TimedOSCPacket]) -> OscPacket {
-    let contents: Vec<OscPacket> = packets.iter().map(|tp| {
-        OscPacket::Bundle(rosc::OscBundle {
+    let mut content: Vec<OscPacket> = vec![
+        OscPacket::Message(OscMessage {
+            addr: "/bundle_info".to_string(),
+            args: vec![OscType::String("nrt_preload".to_string())],
+        }),
+    ];
+    for tp in packets {
+        content.push(OscPacket::Bundle(rosc::OscBundle {
             timetag: osc_timetag_now(),
             content: vec![
                 OscPacket::Message(OscMessage {
@@ -1394,13 +1477,43 @@ fn osc_bundle_from_packets(packets: &[TimedOSCPacket]) -> OscPacket {
                 }),
                 tp.packet.clone(),
             ],
-        })
-    }).collect();
+        }));
+    }
     OscPacket::Bundle(rosc::OscBundle {
         timetag: osc_timetag_now(),
-        content: contents,
+        content,
     })
 }
+
+/// Build metadata-only nrt_record bundle (matching Python: ALL timed data goes in preload).
+/// jdw-sc expects content[1] to be a Bundle (note sequence), even if empty.
+fn build_nrt_record_bundle_meta(bpm: f64, file_name: &str, end_beat: &BigDecimal) -> OscPacket {
+    let bpm_f32: f32 = bpm as f32;
+    let eb_f32: f32 = end_beat.to_string().parse().unwrap_or(0.0);
+    OscPacket::Bundle(rosc::OscBundle {
+        timetag: osc_timetag_now(),
+        content: vec![
+            OscPacket::Message(OscMessage {
+                addr: "/bundle_info".to_string(),
+                args: vec![OscType::String("nrt_record".to_string())],
+            }),
+            OscPacket::Message(OscMessage {
+                addr: "/nrt_record_info".to_string(),
+                args: vec![
+                    OscType::Float(bpm_f32),
+                    OscType::String(file_name.to_string()),
+                    OscType::Float(eb_f32),
+                ],
+            }),
+            OscPacket::Bundle(rosc::OscBundle {
+                timetag: osc_timetag_now(),
+                content: vec![],
+            }),
+        ],
+    })
+}
+
+
 
 /// Full pipeline: setup + queue update + commands for a full Billboard.
 pub fn send_full_billboard(
@@ -1892,7 +2005,7 @@ c4 d4
         assert_eq!(bundles[0].track_name, "test_0_0");
         // Preload messages should include /clear_nrt
         assert!(bundles[0].preload_messages.iter().any(|m| matches!(m, OscPacket::Message(ref msg) if msg.addr == "/clear_nrt")));
-        // NRT bundle should have 3 children
+        // NRT bundle: bundle_info + nrt_record_info + empty inner bundle
         if let OscPacket::Bundle(ref b) = bundles[0].nrt_bundle {
             assert_eq!(b.content.len(), 3);
         } else { panic!("Expected bundle"); }
