@@ -1442,11 +1442,19 @@ pub fn get_nrt_record_bundles(
         let mut all_packets = setup_packets;
         all_packets.extend(osc_packets);
 
+        // Split large preloads into batches to stay under UDP size limit (matching Python's
+        // preload_bundle_batches which groups bundles in chunks of 10).
+        const MAX_PACKETS_PER_BUNDLE: usize = 100;
+        let mut preload_bundles: Vec<OscPacket> = Vec::new();
+        for chunk in all_packets.chunks(MAX_PACKETS_PER_BUNDLE) {
+            preload_bundles.push(build_nrt_preload_bundle_from_packets(chunk));
+        }
+
         results.push(NrtBundleInfo {
             track_name: track_name.clone(),
             nrt_bundle: build_nrt_record_bundle_meta(bpm, &file_name, &end_beat),
             preload_messages: preload_msgs,
-            preload_bundles: vec![build_nrt_preload_bundle_from_packets(&all_packets)],
+            preload_bundles,
         });
     }
 

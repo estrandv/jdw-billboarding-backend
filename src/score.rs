@@ -62,6 +62,14 @@ impl Score {
             .unwrap_or_else(|| BigDecimal::from(0))
     }
 
+    /// Debug: return sum of source durations for each track.
+    pub fn source_sums(&self) -> HashMap<String, BigDecimal> {
+        self.track_sources
+            .iter()
+            .map(|(name, src)| (name.clone(), src.durations.iter().cloned().sum()))
+            .collect()
+    }
+
     /// Extend tracks matching any of `group_names` into the score timeline.
     pub fn extend_groups(&mut self, group_names: &[String], also_extend_groupless: bool) {
         let mut matching: Vec<String> = self
