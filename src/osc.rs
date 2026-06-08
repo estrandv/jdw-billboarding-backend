@@ -502,10 +502,15 @@ fn send_to_router(sock: &UdpSocket, addr: &str, packet: &OscPacket) -> Result<()
 /// Tries int first, then float, falls back to string. This matches
 /// Python's `pythonosc` auto-detection in `OscMessageBuilder.add_arg()`.
 fn osc_arg_from_str(s: &str) -> OscType {
-    // Always use Float for numeric values — jdw-sc's handlers
-    // (NoteModifyMessage, etc.) reject OscType::Int.
-    if let Ok(f) = s.parse::<f32>() {
-        return OscType::Float(f);
+    // jdw-sc handlers have conflicting type expectations:
+    // - /set_bpm expects Int
+    // - /note_modify rejects Int, wants Float
+    // Use Int for integer-looking values, Float for decimals.
+    if let Ok(f) = s.parse::<f64>() {
+        if s.contains('.') {
+            return OscType::Float(f as f32);
+        }
+        return OscType::Float(f as f32); // Always Float for now — NoteModify crashes on Int
     }
     OscType::String(s.to_string())
 }
