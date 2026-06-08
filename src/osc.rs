@@ -502,15 +502,20 @@ fn send_to_router(sock: &UdpSocket, addr: &str, packet: &OscPacket) -> Result<()
 /// Tries int first, then float, falls back to string. This matches
 /// Python's `pythonosc` auto-detection in `OscMessageBuilder.add_arg()`.
 fn osc_arg_from_str(s: &str) -> OscType {
-    // jdw-sc handlers have conflicting type expectations:
-    // - /set_bpm expects Int
-    // - /note_modify rejects Int, wants Float
-    // Use Int for integer-looking values, Float for decimals.
-    if let Ok(f) = s.parse::<f64>() {
-        if s.contains('.') {
-            return OscType::Float(f as f32);
-        }
-        return OscType::Float(f as f32); // Always Float for now — NoteModify crashes on Int
+    if let Ok(i) = s.parse::<i32>() {
+        return OscType::Int(i);
+    }
+    if let Ok(f) = s.parse::<f32>() {
+        return OscType::Float(f);
+    }
+    OscType::String(s.to_string())
+}
+
+/// Like osc_arg_from_str but always returns Float for numeric values.
+/// Used for /note_modify which rejects OscType::Int.
+fn osc_arg_from_str_float(s: &str) -> OscType {
+    if let Ok(f) = s.parse::<f32>() {
+        return OscType::Float(f);
     }
     OscType::String(s.to_string())
 }
@@ -1078,7 +1083,7 @@ pub fn send_full_commands(
                     pairs.sort_by(|a, b| a.0.cmp(b.0));
                     for (k, v) in pairs {
                         mod_args.push(OscType::String(k.clone()));
-                        mod_args.push(osc_arg_from_str(v));
+                        mod_args.push(osc_arg_from_str_float(v));
                     }
                     let mod_msg = OscPacket::Message(OscMessage {
                         addr: "/note_modify".to_string(),
@@ -1367,7 +1372,7 @@ pub fn get_nrt_record_bundles(
                         pairs.sort_by(|a, b| a.0.cmp(b.0));
                         for (k, v) in pairs {
                             mod_args.push(OscType::String(k.clone()));
-                            mod_args.push(osc_arg_from_str(v));
+                            mod_args.push(osc_arg_from_str_float(v));
                         }
                         setup_packets.push(TimedOSCPacket {
                             time: f64_to_bigdecimal(0.0),
