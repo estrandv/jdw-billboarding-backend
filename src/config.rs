@@ -21,6 +21,7 @@ pub struct JdwConfig {
     pub synthdefs_scd_path: Option<String>,
     pub template_synths_path: Option<String>,
     pub sample_pack_dir: Option<String>,
+    pub nrt_output_dir: Option<String>,
     pub first_buffer_index: u32,
 }
 
@@ -38,6 +39,7 @@ impl Default for JdwConfig {
             synthdefs_scd_path: None,
             template_synths_path: None,
             sample_pack_dir: Some("~/sample_packs".to_string()),
+            nrt_output_dir: Some("~/jdw_output".to_string()),
             first_buffer_index: 100,
         }
     }
@@ -82,6 +84,9 @@ impl JdwConfig {
             }
             if let Some(v) = py.get("sample_pack_dir").and_then(|v| v.as_str()) {
                 self.sample_pack_dir = Some(v.to_string());
+            }
+            if let Some(v) = py.get("nrt_output_dir").and_then(|v| v.as_str()) {
+                self.nrt_output_dir = Some(v.to_string());
             }
             if let Some(v) = py.get("first_buffer_index").and_then(|v| v.as_integer()) {
                 self.first_buffer_index = v as u32;
