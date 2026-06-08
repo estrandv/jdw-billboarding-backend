@@ -2000,6 +2000,56 @@ mod tests {
 
     // ========== NRT bundle tests ==========
     #[test]
+    fn test_nrt_always_includes_router_synthdef() {
+        // Router must be loaded for /create_router → /note_on conversion.
+        // Without it, scsynth can't create router synths → silent tracks.
+        let source = "@test:synth\nc4\n";
+        let bb = full::parse(source);
+        let synthdefs = vec![
+            crate::synthdefs::SynthDefMessage { name: "router".to_string(), content: "rdef".to_string() },
+            crate::synthdefs::SynthDefMessage { name: "test".to_string(), content: String::new() },
+        ];
+        let bundles = get_nrt_record_bundles(&bb, &synthdefs, &[]);
+        // Router synthdef must be sent as a preload message
+        let has_router = bundles[0].preload_messages.iter().any(|m| {
+            if let OscPacket::Message(ref msg) = m {
+                msg.addr == "/create_synthdef" && msg.args.iter().any(|a| a == &OscType::String("rdef".into()))
+            } else { false }
+        });
+        assert!(has_router, "router synthdef must be included in preload messages");
+    }
+
+    #[test]
+    fn test_nrt_sampler_synthdef_only_for_sampler_tracks() {
+        // sampler synthdef should only load for sampler tracks, not synths
+        let source = "@test:synth\nc4\n";
+        let bb = full::parse(source);
+        let synthdefs = vec![
+            crate::synthdefs::SynthDefMessage { name: "sampler".to_string(), content: "sdef".to_string() },
+            crate::synthdefs::SynthDefMessage { name: "test".to_string(), content: String::new() },
+        ];
+        let bundles = get_nrt_record_bundles(&bb, &synthdefs, &[]);
+        let has_sampler = bundles[0].preload_messages.iter().any(|m| {
+            if let OscPacket::Message(ref msg) = m {
+                msg.addr == "/create_synthdef" && msg.args.iter().any(|a| a == &OscType::String("sdef".into()))
+            } else { false }
+        });
+        assert!(!has_sampler, "sampler synthdef must NOT load for non-sampler tracks");
+    }
+
+    #[test]
+    fn test_nrt_preload_bundles_produced() {
+        // Even with minimal source, preload_bundles Vec is constructed (may be empty
+        // if no commands/effects, but the Vec itself exists).
+        let source = "/set_bpm 120\n@test:pad\n>>> pad\nc4\n";
+        let bb = full::parse(&source);
+        let bundles = get_nrt_record_bundles(&bb, &[], &[]);
+        assert_eq!(bundles.len(), 1);
+        // With /set_bpm command, there's at least one setup packet → one preload bundle
+        assert!(!bundles[0].preload_bundles.is_empty());
+    }
+
+    #[test]
     fn test_get_nrt_record_bundles_basic() {
         let source = "\
 @test:synth

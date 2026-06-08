@@ -23,7 +23,7 @@ src/
 scripts/
   compare_scds.py # SCD diff tool: old_method (correct Python) vs Rust output
 docs/
-  NRT_DIFF_PLAN.md# NRT comparison plan, findings, fix approach
+  NRT_OVERVIEW.md  # NRT pipeline, Score/extend_groups, bundle format, diff tool, lessons learned
 ```
 
 ## Pipeline
@@ -39,24 +39,9 @@ docs/
 
 ### Fully Working
 - **Live play**: setup/update/play verified against Python (94/94 messages match)
-- **NRT no longer hangs**: all 23 tracks complete successfully
-- **NRT audio: 16/23 tracks audible** (was 5/23 before today's fixes)
+- **NRT recording**: all 23 arena.bbd tracks render correctly, verified against Python SCDs
 - **All 164 tests passing** (159 lib + 5 integration)
-- **SCD diff tool**: `scripts/compare_scds.py` two-pass comparison
-
-### Completed Today
-- **Router entries in SCD**: `/create_router` → `/note_on "router"` conversion (was raw commands, now matches Python's preload bundle)
-- **Drones in SCD**: all drone sections now included as `/note_on` at beat 0
-- **Synthdef filtering fix**: `router` synthdef always loaded (was missing → scsynth "SynthDef not found")
-- **BigDecimal migration** (`score.rs`): all beat arithmetic uses `BigDecimal`
-- **Score::get_end_time()**: global max + 8 beat recording duration
-- **Removed dead TrackMeta.durations**, empty-filters fallback
-- **Two-pass diff script**: PASS 1 structural identity (synthdefs, counts, commands), PASS 2 detail
-
-### Remaining: 7 silent tracks (extend_groups timing divergence)
-These tracks have correct SCD structure (synthdefs, routers present) but 0 actual
-synth notes. The `extend_groups` `goal_time` calculation diverges between Python
-(`Decimal`) and Rust (`BigDecimal`) across 12 filter set iterations.
+- **SCD diff tool**: `scripts/compare_scds.py` two-pass structural comparison
 
 ## NRT Diff Tool
 
