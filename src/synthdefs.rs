@@ -238,7 +238,7 @@ fn load_synthdefs_from_templates(
             }
             Err(e) => {
                 // Skip invalid definitions, but log
-                eprintln!("Warning: failed to compile synthdef: {}", e);
+                log::warn!("failed to compile synthdef: {}", e);
             }
         }
     }
@@ -270,7 +270,7 @@ pub fn load_synthdefs(
                         }
                     }
                 }
-                Err(e) => eprintln!("Warning: failed to load synthdefs from '{}': {}", path, e),
+                Err(e) => log::warn!("failed to load synthdefs from '{}': {}", path, e),
             }
         }
     }
@@ -286,8 +286,8 @@ pub fn load_synthdefs(
                         }
                     }
                 }
-                Err(e) => eprintln!(
-                    "Warning: failed to load template synths from '{}': {}",
+                Err(e) => log::warn!(
+                    "failed to load template synths from '{}': {}",
                     path, e
                 ),
             }

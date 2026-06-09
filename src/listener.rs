@@ -28,8 +28,14 @@ impl Listener {
     /// Start listening on `port`, returns the bound listener.
     ///
     /// If `port` is 0, the OS assigns a random available port.
+    /// Binds to `127.0.0.1` by default.
     pub fn start(port: u16) -> Result<Self, String> {
-        let addr = format!("127.0.0.1:{}", port);
+        Self::start_with_addr("127.0.0.1", port)
+    }
+
+    /// Start listening on a specific address and port.
+    pub fn start_with_addr(host: &str, port: u16) -> Result<Self, String> {
+        let addr = format!("{}:{}", host, port);
         let socket = UdpSocket::bind(&addr).map_err(|e| format!("Listener bind: {}", e))?;
         socket
             .set_read_timeout(Some(Duration::from_millis(500)))
