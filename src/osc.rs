@@ -408,6 +408,33 @@ pub fn send_effects_clear(config: &OscConfig) -> Result<(), String> {
     send_to_router(&sock, &config.router_addr, &msg)
 }
 
+/// Modulate existing effects' parameters via `/note_modify` instead of
+/// destroying and recreating them. Used during `--update` to avoid gaps or
+/// glitches from killing running effect nodes.
+/// Matches Python's `get_all_effects_mod()`.
+pub fn send_effects_modulate(billboard: &full::Billboard, config: &OscConfig) -> Result<(), String> {
+    let sock = UdpSocket::bind("127.0.0.1:0").map_err(|e| format!("bind: {}", e))?;
+
+    for section in &billboard.sections {
+        let group_name = section.header.group.as_deref().unwrap_or("");
+        for effect in &section.effects {
+            let ext_id = format!("effect_{}_{}", group_name, effect.id);
+            let mut args = vec![
+                OscType::String(ext_id),
+                OscType::Int(0), // delay
+            ];
+            args.extend(args_as_osc(&effect.args, &[]));
+            let msg = OscPacket::Message(OscMessage {
+                addr: "/note_modify".to_string(),
+                args,
+            });
+            send_to_router(&sock, &config.router_addr, &msg)?;
+            std::thread::sleep(Duration::from_millis(DELAY_CONFIGURE_MS));
+        }
+    }
+    Ok(())
+}
+
 /// Create all `€`-defined effects via `/note_on`.
 /// Matches Python's `get_all_effects_create()`.
 pub fn send_effects_create(billboard: &full::Billboard, config: &OscConfig) -> Result<(), String> {
